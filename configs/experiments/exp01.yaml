@@ -1,5 +1,4 @@
 EXP: 'exp01'
-SEED: 37
 DPR:
   SOLVER:
     NUM_TRAIN_EPOCH: 2

@@ -1,13 +1,16 @@
 """
-train model
+config test
 Usage:
-    train.py [--path_output=<path>] [--path_cfg_data=<path>]  [--path_cfg_override=<path>]
-    train.py -h | --help
+    config.py --path_output=<path> --path_data=<path> [--path_train_data=<path>] [--path_val_data=<path>] [--path_cfg_exp=<path>]
+    config.py -h | --help
+
 Options:
-    -h --help               show this screen help
-    --path_output=<path>               output path
-    --path_cfg_data=<path>       data config path
-    --path_cfg_override=<path>            training config path
+    -h --help                   show this screen help
+    --path_output=<path>        output path
+    --path_data=<path>          data path
+    --path_train_data=<path>    train data path
+    --path_val_data=<path>      validation data path
+    --path_cfg_exp=<path>       experiment config path
 """
 # [default: configs/data.yaml]
 import os
@@ -29,8 +32,8 @@ _C = CfgNode()
 # cfg = _C
 _C.DESCRIPTION = 'Default config from the Singleton'
 _C.VERSION = 0
-_C.OUTPUT_PATH = './output/'
-_C.EXP = None
+_C.OUTPUT_PATH = '../output/'
+_C.EXP = 'default'
 _C.SEED = 42
 _C.DEVICE = None
 _C.LOCAL_RANK = -1
@@ -49,8 +52,10 @@ _C.DPR = CfgNode()
 # -----------------------------------------------------------------------------
 _C.DPR.DATA = CfgNode()
 _C.DPR.DATA.NAME = 'hetPQA'
-_C.DPR.DATA.TRAIN_DATA_PATH = './data/evidence_ranking_train_grouped.json'
-_C.DPR.DATA.VAL_DATA_PATH = './data/evidence_ranking_dev_grouped.json'
+_C.DPR.DATA.DATA_PATH = '../data/'
+_C.DPR.DATA.TRAIN_DATA_PATH = '../data/train.json'
+_C.DPR.DATA.VAL_DATA_PATH = '../data/dev.json'
+_C.DPR.DATA.TEST_DATA_PATH = '../data/test.json'
 _C.DPR.DATA.HARD_NEGATIVES = 1
 _C.DPR.DATA.OTHER_NEGATIVES = 0
 
@@ -196,22 +201,25 @@ def combine_cfgs(path_cfg_data: Path=None, path_cfg_override: Path=None):
 if __name__ == '__main__':
     arguments = docopt(__doc__, argv=None, help=True, version=None, options_first=False)
     output_path = arguments['--path_output']
-    data_path = arguments['--path_cfg_data']
-    cfg_path = arguments['--path_cfg_override']
-    cfg = get_cfg_defaults()
+    data_path = arguments['--path_data']
+    train_data_path = arguments['--path_train_data']
+    val_data_path = arguments['--path_val_data']
+    exp_cfg_path = arguments['--path_cfg_exp']
+    config = get_cfg_defaults()
     if data_path is not None:
-        print(data_path)
-        cfg.merge_from_file(data_path)
-    if cfg_path is not None:
-        cfg.merge_from_file(cfg_path)
+        config.DPR.DATA.DATA_PATH = data_path
+        config.DPR.DATA.TRAIN_DATA_PATH = os.path.join(data_path, 'train.json')
+        config.DPR.DATA.VAL_DATA_PATH = os.path.join(data_path, 'dev.json')
+    if train_data_path is not None:
+        config.DPR.DATA.TRAIN_DATA_PATH = train_data_path
+    if val_data_path is not None:
+        config.DPR.DATA.VAL_DATA_PATH = val_data_path
+    if exp_cfg_path is not None:
+        config.merge_from_file(exp_cfg_path)
     if output_path is not None:
-        cfg.OUTPUT_PATH = output_path
-    # train(cfg)
+        config.OUTPUT_PATH = output_path
 
     # Make result folders if they do not exist
-    exp_dir = os.path.join(cfg.OUTPUT_PATH, cfg.EXP)
-    if not os.path.exists(exp_dir):
-        os.makedirs(exp_dir, exist_ok=True)
-    print(cfg)
-    cfg.dump(stream=open(os.path.join(exp_dir, f'config_{cfg.EXP}.yaml'), 'w'))
+    print(config)
+    # config.dump(stream=open(os.path.join(exp_dir, f'config_{config.EXP}.yaml'), 'w'))
     # python - m src.tools.train - o experiments/exp10 --cfg src/config/experiments/exp10.yaml
