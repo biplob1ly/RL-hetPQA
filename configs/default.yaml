@@ -1,0 +1,64 @@
+
+# Seed for randomness
+seed: 42
+data_dir: './data/'
+train_data_path: './data/evidence_ranking_train_grouped.json'
+dev_data_path: './data/evidence_ranking_dev_grouped.json'
+output_dir: './output/'
+dpr_checkpoint_file_name: dpr_biencoder
+reset_optimizer: False
+# A trained bi-encoder checkpoint file to initialize the model
+dpr_model_file:
+
+# LOCAL_RANK for distributed training on gpus. -1 means not distributed.
+LOCAL_RANK: -1
+device:
+distributed_world_size:
+no_cuda: False
+n_gpu:
+fp16: False
+# For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
+#        "See details at https://nvidia.github.io/apex/amp.html
+fp16_opt_level: O1
+
+# config name for model initialization
+pretrained_model_cfg: bert-base-uncased
+# Some encoders need to be initialized from a file
+pretrained_file:
+# model type. One of [hf_bert, pytext_bert, fairseq_roberta]
+encoder_model_type: hf_bert
+# Extra linear layer on top of standard bert/roberta encoder
+projection_dim: 0
+# Max length of the encoder input sequence
+sequence_length: 512
+# Whether to lower case the input text. Set True for uncased models, False for the cased ones.
+do_lower_case: True
+
+
+# -------------Biencoder default ---------------------
+batch_size: 2
+dev_batch_size: 4
+adam_eps: 1e-8
+adam_betas: (0.9, 0.999)
+max_grad_norm: 1.0
+log_batch_step: 2
+train_rolling_loss_step: 2
+weight_decay: 0.0
+learning_rate: 1e-5
+
+# Linear warmup over warmup_steps.
+warmup_steps: 100
+
+# Number of updates steps to accumulate before performing a backward/update pass.
+gradient_accumulation_steps: 1
+
+# Total number of training epochs to perform.
+num_train_epochs: 2
+eval_per_epoch: 1
+hard_negatives: 1
+other_negatives: 0
+val_av_rank_start_epoch: 1
+val_av_rank_hard_neg: 30
+val_av_rank_other_neg: 30
+val_av_rank_bsz: 128
+val_av_rank_max_qs: 10000
