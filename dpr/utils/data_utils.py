@@ -65,7 +65,7 @@ def remove_key(json_dt, key='normalized_value'):
         return json_dt.strip() if isinstance(json_dt, str) else json_dt
 
 
-def normalize_attr_passage(s):
+def normalize_attr_passage(s, do_flatten=False):
     # We'll start by removing any extraneous white spaces
     s = re.sub('(\d+\.)}', '\g<1>0}', s)
     s = re.sub(r'\\"', ' inches', s)
@@ -76,7 +76,7 @@ def normalize_attr_passage(s):
         t = re.sub('(\w+):', '"\g<1>":', s)
         json_dt = json.loads('{' + t + '}')
         json_dt = remove_key(json_dt)
-        out = json.dumps(flatten(json_dt))
+        out = json.dumps(flatten(json_dt) if do_flatten else json_dt)
     except:
         s = re.sub('\"', '', s)
         s = re.sub(':([^[,}{]+)(,|})', ':"\g<1>"\g<2>', s)
@@ -84,7 +84,7 @@ def normalize_attr_passage(s):
         try:
             json_dt = json.loads('{' + s + '}')
             json_dt = remove_key(json_dt)
-            out = json.dumps(flatten(json_dt))
+            out = json.dumps(flatten(json_dt) if do_flatten else json_dt)
         except:
             out = s
     out = re.sub('["\[\]}{]', '', out)
@@ -154,6 +154,7 @@ class JsonQADataset(QADataset):
         encoder_type: str = None,
         shuffle_positives: bool = False,
         normalize: bool = False,
+        flatten_attr: bool = False,
         query_special_suffix: str = None,
         # tmp: for cc-net results only
         exclude_gold: bool = False,
@@ -167,6 +168,7 @@ class JsonQADataset(QADataset):
         self.file = file
         self.data_files = []
         self.normalize = normalize
+        self.flatten_attr = flatten_attr
         self.exclude_gold = exclude_gold
 
     def calc_total_data_len(self):
@@ -187,7 +189,7 @@ class JsonQADataset(QADataset):
         logger.info("Data files: %s", self.data_files)
         data = read_data_from_json_files(self.data_files)
         # filter those without positive ctx
-        self.data = [r for r in data if len(r["positive_ctxs"]) > 0][:8]      # TODO: remove subscript
+        self.data = [r for r in data if len(r["positive_ctxs"]) > 0]      # TODO: remove subscript
         logger.info("Total cleaned data size: %d", len(self.data))
 
     def __getitem__(self, index) -> BiEncoderSample:
@@ -202,7 +204,7 @@ class JsonQADataset(QADataset):
         def create_passage(ctx: dict):
             if self.normalize:
                 if ctx.get("source", None) == "attribute":
-                    ctx["text"] = normalize_attr_passage(ctx["text"])
+                    ctx["text"] = normalize_attr_passage(ctx["text"], self.flatten_attr)
             return BiEncoderPassage(
                 ctx.get("cid", None),
                 ctx["text"],

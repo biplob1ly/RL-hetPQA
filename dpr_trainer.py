@@ -16,6 +16,7 @@ from docopt import docopt
 import os
 import shutil
 import time
+import heapq
 from datetime import datetime
 import math
 import torch
@@ -68,10 +69,13 @@ class RetrieverTrainer:
         self.tensorizer = tensorizer
         self.start_epoch = 0
         self.start_batch = 0
+        self.top_cp_scores = []
         self.scheduler_state = None
         self.best_validation_result = None
         self.best_cp_name = None
-        self.train_dataset = JsonQADataset(cfg.DPR.DATA.TRAIN_DATA_PATH)
+        self.train_dataset = JsonQADataset(cfg.DPR.DATA.TRAIN_DATA_PATH,
+                                           normalize=cfg.DPR.DATA.NORMALIZE,
+                                           flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
         self.val_dataset = JsonQADataset(cfg.DPR.DATA.VAL_DATA_PATH)
         self.loss_function = BiEncoderNllLoss()
         if saved_state:
@@ -131,24 +135,25 @@ class RetrieverTrainer:
 
     def _do_biencoder_fwd_pass(
             self,
-            input: BiEncoderBatch
+            batch_input: BiEncoderBatch
     ) -> Tuple[torch.Tensor, int]:
-        input = BiEncoderBatch(**move_to_device(input._asdict(), self.cfg.DEVICE))
+        batch_input = BiEncoderBatch(**move_to_device(batch_input._asdict(), self.cfg.DEVICE))
 
-        q_attn_mask = self.tensorizer.get_attn_mask(input.question_ids)
-        ctx_attn_mask = self.tensorizer.get_attn_mask(input.context_ids)
+        q_attn_mask = self.tensorizer.get_attn_mask(batch_input.question_ids)
+        ctx_attn_mask = self.tensorizer.get_attn_mask(batch_input.context_ids)
 
         if self.biencoder.training:
-            model_out = self.biencoder(input.question_ids, input.question_segments, q_attn_mask, input.context_ids,
-                              input.ctx_segments, ctx_attn_mask)
+            model_out = self.biencoder(batch_input.question_ids, batch_input.question_segments, q_attn_mask,
+                                       batch_input.context_ids, batch_input.ctx_segments, ctx_attn_mask)
         else:
             with torch.no_grad():
-                model_out = self.biencoder(input.question_ids, input.question_segments, q_attn_mask, input.context_ids,
-                                  input.ctx_segments, ctx_attn_mask)
+                model_out = self.biencoder(batch_input.question_ids, batch_input.question_segments, q_attn_mask,
+                                           batch_input.context_ids, batch_input.ctx_segments, ctx_attn_mask)
 
         local_q_vector, local_ctx_vectors = model_out
-        loss, correct_predictions_count = self._calc_loss(local_q_vector, local_ctx_vectors, input.is_positive,
-                                      input.hard_negatives)
+        loss, correct_predictions_count = self._calc_loss(local_q_vector, local_ctx_vectors,
+                                                          batch_input.positive_ctx_indices,
+                                                          batch_input.hard_neg_ctx_indices)
 
         total_correct_preds = correct_predictions_count.sum().item()
 
@@ -242,7 +247,7 @@ class RetrieverTrainer:
 
                 ctx_represenations.extend(ctx_dense.cpu().split(1, dim=0))
 
-            batch_positive_idxs = biencoder_input.is_positive
+            batch_positive_idxs = biencoder_input.positive_ctx_indices
             positive_idx_per_question.extend([total_ctxs + v for v in batch_positive_idxs])
 
             if (i + 1) % log_result_step == 0:
@@ -350,8 +355,8 @@ class RetrieverTrainer:
         # for distributed mode, save checkpoint for only one process
         save_cp = cfg.LOCAL_RANK in [-1, 0]
 
-        if epoch == cfg.DPR.SOLVER.VAL_AV_RANK_START_EPOCH:
-            self.best_validation_result = None
+        # if epoch == cfg.DPR.SOLVER.VAL_AV_RANK_START_EPOCH:
+        #     self.best_validation_result = None
 
         if cfg.DPR.DATA.VAL_DATA_PATH:
             if epoch >= cfg.DPR.SOLVER.VAL_AV_RANK_START_EPOCH:
@@ -362,12 +367,18 @@ class RetrieverTrainer:
             validation_loss = 0
 
         if save_cp:
-            cp_name = self._save_checkpoint(scheduler, epoch, iteration)
-
-            if validation_loss < (self.best_validation_result or validation_loss + 1):
-                self.best_validation_result = validation_loss
-                self.best_cp_name = cp_name
-                logger.info('New Best validation checkpoint %s', cp_name)
+            if len(self.top_cp_scores) < cfg.DPR.SOLVER.CP_SAVE_LIMIT:
+                cp_path = self._save_checkpoint(scheduler, epoch, iteration)
+                heapq.heappush(self.top_cp_scores, (-validation_loss, cp_path))
+                if max(self.top_cp_scores)[1] == cp_path:
+                    logger.info('New Best validation checkpoint %s', cp_path)
+            elif validation_loss < -self.top_cp_scores[0][0]:
+                _, cp_path_to_delete = heapq.heappop(self.top_cp_scores)
+                os.remove(cp_path_to_delete)
+                cp_path = self._save_checkpoint(scheduler, epoch, iteration)
+                heapq.heappush(self.top_cp_scores, (-validation_loss, cp_path))
+                if max(self.top_cp_scores)[1] == cp_path:
+                    logger.info('New Best validation checkpoint %s', cp_path)
 
     def _train_epoch(
         self,
@@ -398,7 +409,7 @@ class RetrieverTrainer:
             data_iteration = train_data_iterator.get_iteration()
             random.seed(seed + epoch + data_iteration)
 
-            biencoder_batch = BiEncoder.create_biencoder_input(
+            batch_input = BiEncoder.create_biencoder_input(
                 samples=samples_batch,
                 tensorizer=self.tensorizer,
                 insert_title=True,
@@ -408,7 +419,7 @@ class RetrieverTrainer:
                 shuffle_positives=self.train_dataset.shuffle_positives
             )
 
-            loss, correct_cnt = self._do_biencoder_fwd_pass(biencoder_batch)
+            loss, correct_cnt = self._do_biencoder_fwd_pass(batch_input)
             epoch_correct_predictions += correct_cnt
             epoch_loss += loss.item()
             rolling_train_loss += loss.item()
@@ -501,6 +512,10 @@ class RetrieverTrainer:
             self._train_epoch(scheduler, epoch, eval_step, train_iterator)
 
         if cfg.LOCAL_RANK in [-1, 0]:
+            logger.info('validation loss\tcp_path ')
+            for neg_val_loss, cp_path in sorted(self.top_cp_scores, reverse=True):
+                print(f'{-neg_val_loss:<15.5f}\t{cp_path}')
+                logger.info(f'{-neg_val_loss:<15.5f}\t{cp_path}')
             logger.info("Training finished. Best validation checkpoint %s", self.best_cp_name)
 
     def _load_saved_state(self, saved_state: CheckpointState, strict=True):

@@ -17,8 +17,8 @@ BiEncoderBatch = collections.namedtuple(
          'question_segments',
          'context_ids',
          'ctx_segments',
-         'is_positive',
-         'hard_negatives'
+         'positive_ctx_indices',
+         'hard_neg_ctx_indices'
     ]
 )
 
