@@ -24,7 +24,7 @@ BiEncoderBatch = collections.namedtuple(
 BiEncoderSingle = collections.namedtuple(
     'BiENcoderSingle',
     [
-        'question_ids',
+         'question_ids',
          'question_segments',
          'context_ids',
          'ctx_segments'

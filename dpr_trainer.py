@@ -29,7 +29,7 @@ from typing import Tuple, Dict
 from configs.config import get_cfg_defaults
 
 from dpr.models.hf_models import get_bert_biencoder_components
-from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch
+from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch, BiEncoderSingle
 from dpr.utils.model_utils import (
     load_states_from_checkpoint, get_model_obj,
     setup_for_distributed_mode, CheckpointState,
@@ -99,13 +99,12 @@ class RetrieverTrainer:
         self,
         dataset: JsonQADataset,
         batch_size: int,
-        is_train_set: bool,
         shuffle=True,
         shuffle_seed: int = 0,
         offset: int = 0
     ):
         dataset.load_data()
-        logger.info("Initializing %s iterator, size: %d", 'training' if is_train_set else 'validation', len(dataset))
+        logger.info("Initializing data iterator, size: %d", len(dataset))
         return SharedDataIterator(
             dataset=dataset,
             shard_id=self.shard_id,
@@ -196,7 +195,6 @@ class RetrieverTrainer:
             self.dev_iterator = self.get_data_iterator(
                 dataset=self.val_dataset,
                 batch_size=cfg.DPR.SOLVER.VAL_BATCH_SIZE,
-                is_train_set=False,
                 shuffle=False
             )
         data_iterator = self.dev_iterator
@@ -306,7 +304,6 @@ class RetrieverTrainer:
         test_iterator = self.get_data_iterator(
                 dataset=self.test_dataset,
                 batch_size=cfg.DPR.SOLVER.TEST_BATCH_SIZE,
-                is_train_set=False,
                 shuffle=False
         )
         start_time = time.time()
@@ -314,21 +311,21 @@ class RetrieverTrainer:
         result_list = []
         for i, samples_batch in enumerate(test_iterator.iterate_data()):
             # Do not shuffle test positives/negatives
-            qid, all_ctx_ids, positive_ctx_ids, batch_input = BiEncoder.create_biencoder_single(
+            qid, all_ctx_ids, positive_ctx_ids, single_input = BiEncoder.create_biencoder_single(
                 sample=samples_batch[0],
                 tensorizer=self.tensorizer,
                 insert_title=True
             )
-            batch_input = BiEncoderBatch(**move_to_device(batch_input._asdict(), cfg.DEVICE))
-            q_attn_mask = self.tensorizer.get_attn_mask(batch_input.question_ids)
-            ctx_attn_mask = self.tensorizer.get_attn_mask(batch_input.context_ids)
+            single_input = BiEncoderSingle(**move_to_device(single_input._asdict(), cfg.DEVICE))
+            q_attn_mask = self.tensorizer.get_attn_mask(single_input.question_ids)
+            ctx_attn_mask = self.tensorizer.get_attn_mask(single_input.context_ids)
             with torch.no_grad():
                 q_embeds, ctx_embeds = self.biencoder(
-                    batch_input.question_ids,
-                    batch_input.question_segments,
+                    single_input.question_ids,
+                    single_input.question_segments,
                     q_attn_mask,
-                    batch_input.context_ids,
-                    batch_input.ctx_segments,
+                    single_input.context_ids,
+                    single_input.ctx_segments,
                     ctx_attn_mask
                 )
             indexer = DenseFlatIndexer(self.biencoder.ctx_model.get_out_size())
@@ -359,7 +356,6 @@ class RetrieverTrainer:
             self.dev_iterator = self.get_data_iterator(
                 dataset=self.val_dataset,
                 batch_size=cfg.DPR.SOLVER.VAL_BATCH_SIZE,
-                is_train_set=False,
                 shuffle=False
             )
         data_iterator = self.dev_iterator
@@ -556,7 +552,6 @@ class RetrieverTrainer:
         train_iterator = self.get_data_iterator(
             dataset=self.train_dataset,
             batch_size=cfg.DPR.SOLVER.TRAIN_BATCH_SIZE,
-            is_train_set=True,
             shuffle=True,
             shuffle_seed=cfg.SEED,
             offset=self.start_batch
@@ -660,5 +655,4 @@ if __name__ == "__main__":
     config.dump(stream=open(os.path.join(config.OUTPUT_PATH, f'config_{config.EXP}.yaml'), 'w'))
     logger.info("Started logging...")
     run(config)
-
     shutil.copy(src='eval_logs.log', dst=config.OUTPUT_PATH)
