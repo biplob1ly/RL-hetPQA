@@ -1,7 +1,7 @@
 """
 train model
 Usage:
-    dpr_trainer.py --path_output=<path> --path_data=<path> [--path_train_data=<path>] [--path_val_data=<path>] [--path_cfg_exp=<path>]
+    dpr_trainer.py --path_output=<path> --path_data=<path> [--path_train_data=<path>] [--path_val_data=<path>] [--path_test_data=<path>] [--path_cfg_exp=<path>]
     dpr_trainer.py -h | --help
 
 Options:
@@ -10,6 +10,7 @@ Options:
     --path_data=<path>          data path
     --path_train_data=<path>    train data path
     --path_val_data=<path>      validation data path
+    --path_test_data=<path>     Test data path
     --path_cfg_exp=<path>       experiment config path
 """
 from docopt import docopt
@@ -23,7 +24,8 @@ import torch
 from torch import Tensor as T
 import logging
 import random
-from typing import Tuple
+import numpy as np
+from typing import Tuple, Dict
 from configs.config import get_cfg_defaults
 
 from dpr.models.hf_models import get_bert_biencoder_components
@@ -35,12 +37,14 @@ from dpr.utils.model_utils import (
 )
 from dpr.options import set_encoder_params_from_state, get_encoder_params_state, setup_cfg_gpu, set_seed
 from dpr.utils.data_utils import JsonQADataset, SharedDataIterator
+from dpr.indexer.faiss_indexers import DenseFlatIndexer
+from utils import save_ranking_results, save_eval_metrics, compute_eval_scores
 
 logging.basicConfig(
-    filename='logs.log',
+    filename='eval_logs.log',
     filemode='w',
     format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-    datefmt='%m/%d/%Y %H:%M:%S', level=logging.DEBUG)
+    datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -73,10 +77,18 @@ class RetrieverTrainer:
         self.scheduler_state = None
         self.best_validation_result = None
         self.best_cp_name = None
-        self.train_dataset = JsonQADataset(cfg.DPR.DATA.TRAIN_DATA_PATH,
-                                           normalize=cfg.DPR.DATA.NORMALIZE,
-                                           flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
-        self.val_dataset = JsonQADataset(cfg.DPR.DATA.VAL_DATA_PATH)
+        if cfg.DPR.DO_TRAIN:
+            self.train_dataset = JsonQADataset(cfg.DPR.DATA.TRAIN_DATA_PATH,
+                                               shuffle_positives=True,
+                                               normalize=cfg.DPR.DATA.NORMALIZE,
+                                               flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
+            self.val_dataset = JsonQADataset(cfg.DPR.DATA.VAL_DATA_PATH,
+                                             normalize=cfg.DPR.DATA.NORMALIZE,
+                                             flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
+        if cfg.DPR.DO_TEST:
+            self.test_dataset = JsonQADataset(cfg.DPR.DATA.TEST_DATA_PATH,
+                                              normalize=cfg.DPR.DATA.NORMALIZE,
+                                              flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
         self.loss_function = BiEncoderNllLoss()
         if saved_state:
             strict = True if cfg.DPR.MODEL.PROJECTION_DIM == 0 else False
@@ -85,13 +97,13 @@ class RetrieverTrainer:
 
     def get_data_iterator(
         self,
+        dataset: JsonQADataset,
         batch_size: int,
         is_train_set: bool,
         shuffle=True,
         shuffle_seed: int = 0,
         offset: int = 0
     ):
-        dataset = self.train_dataset if is_train_set else self.val_dataset
         dataset.load_data()
         logger.info("Initializing %s iterator, size: %d", 'training' if is_train_set else 'validation', len(dataset))
         return SharedDataIterator(
@@ -101,12 +113,13 @@ class RetrieverTrainer:
             batch_size=batch_size,
             shuffle=shuffle,
             shuffle_seed=shuffle_seed,
-            offset=offset
+            offset=offset,
+            strict_batch_size=True
         )
 
     def _calc_loss(
             self,
-            local_q_vector,
+            local_q_vectors,
             local_ctx_vectors,
             local_positive_idxs,
             local_hard_negatives_idxs: list = None,
@@ -120,13 +133,13 @@ class RetrieverTrainer:
         if distributed_world_size > 1:
             raise NotImplementedError
         else:
-            global_q_vector = local_q_vector
+            global_q_vectors = local_q_vectors
             global_ctxs_vector = local_ctx_vectors
             positive_idx_per_question = local_positive_idxs
             hard_negatives_per_question = local_hard_negatives_idxs
 
         loss, correct_predictions_count = self.loss_function.calc(
-            global_q_vector,
+            global_q_vectors,
             global_ctxs_vector,
             positive_idx_per_question,
             hard_negatives_per_question
@@ -150,8 +163,8 @@ class RetrieverTrainer:
                 model_out = self.biencoder(batch_input.question_ids, batch_input.question_segments, q_attn_mask,
                                            batch_input.context_ids, batch_input.ctx_segments, ctx_attn_mask)
 
-        local_q_vector, local_ctx_vectors = model_out
-        loss, correct_predictions_count = self._calc_loss(local_q_vector, local_ctx_vectors,
+        local_q_vectors, local_ctx_vectors = model_out
+        loss, correct_predictions_count = self._calc_loss(local_q_vectors, local_ctx_vectors,
                                                           batch_input.positive_ctx_indices,
                                                           batch_input.hard_neg_ctx_indices)
 
@@ -181,6 +194,7 @@ class RetrieverTrainer:
         distributed_factor = self.distributed_factor
         if not self.dev_iterator:
             self.dev_iterator = self.get_data_iterator(
+                dataset=self.val_dataset,
                 batch_size=cfg.DPR.SOLVER.VAL_BATCH_SIZE,
                 is_train_set=False,
                 shuffle=False
@@ -201,7 +215,7 @@ class RetrieverTrainer:
         for i, samples_batch in enumerate(data_iterator.iterate_data()):
             if len(q_represenations) > cfg.DPR.SOLVER.VAL_AV_RANK_MAX_QS / distributed_factor:
                 break
-            biencoder_input = BiEncoder.create_biencoder_input(
+            batch_input = BiEncoder.create_biencoder_input(
                 samples=samples_batch,
                 tensorizer=self.tensorizer,
                 insert_title=True,
@@ -209,17 +223,18 @@ class RetrieverTrainer:
                 num_other_negatives=num_other_negatives,
                 shuffle=False
             )
-            biencoder_input = BiEncoderBatch(**move_to_device(biencoder_input._asdict(), cfg.DEVICE))
+            batch_input = BiEncoderBatch(**move_to_device(batch_input._asdict(), cfg.DEVICE))
             total_ctxs = len(ctx_represenations)
-            ctxs_ids = biencoder_input.context_ids
-            ctxs_segments = biencoder_input.ctx_segments
+            ctxs_ids = batch_input.context_ids
+            ctxs_segments = batch_input.ctx_segments
             bsz = ctxs_ids.size(0)
+            print(bsz, sub_batch_size)
 
             # split contexts batch into sub batches since it is supposed to be too large to be processed in one batch
             for j, batch_start in enumerate(range(0, bsz, sub_batch_size)):
 
                 q_ids, q_segments = (
-                    (biencoder_input.question_ids, biencoder_input.question_segments) if j == 0 else (None, None)
+                    (batch_input.question_ids, batch_input.question_segments) if j == 0 else (None, None)
                 )
 
                 if j == 0 and cfg.N_GPU > 1 and q_ids.size(0) == 1:
@@ -247,13 +262,13 @@ class RetrieverTrainer:
 
                 ctx_represenations.extend(ctx_dense.cpu().split(1, dim=0))
 
-            batch_positive_idxs = biencoder_input.positive_ctx_indices
+            batch_positive_idxs = batch_input.positive_ctx_indices
             positive_idx_per_question.extend([total_ctxs + v for v in batch_positive_idxs])
 
             if (i + 1) % log_result_step == 0:
                 logger.info(
                     "Av.rank validation: step %d, computed ctx_vectors %d, q_vectors %d",
-                    i,
+                    i+1,
                     len(ctx_represenations),
                     len(q_represenations),
                 )
@@ -283,12 +298,66 @@ class RetrieverTrainer:
         logger.info('Av.rank validation: average rank %s, total questions=%d', av_rank, q_num)
         return av_rank
 
+    def test(self):
+        logger.info('Evaluating ranker ...')
+        cfg = self.cfg
+        self.biencoder.eval()
+        distributed_factor = self.distributed_factor
+        test_iterator = self.get_data_iterator(
+                dataset=self.test_dataset,
+                batch_size=cfg.DPR.SOLVER.TEST_BATCH_SIZE,
+                is_train_set=False,
+                shuffle=False
+        )
+        start_time = time.time()
+        log_result_step = cfg.DPR.SOLVER.LOG_TEST_STEP
+        result_list = []
+        for i, samples_batch in enumerate(test_iterator.iterate_data()):
+            # Do not shuffle test positives/negatives
+            qid, all_ctx_ids, positive_ctx_ids, batch_input = BiEncoder.create_biencoder_single(
+                sample=samples_batch[0],
+                tensorizer=self.tensorizer,
+                insert_title=True
+            )
+            batch_input = BiEncoderBatch(**move_to_device(batch_input._asdict(), cfg.DEVICE))
+            q_attn_mask = self.tensorizer.get_attn_mask(batch_input.question_ids)
+            ctx_attn_mask = self.tensorizer.get_attn_mask(batch_input.context_ids)
+            with torch.no_grad():
+                q_embeds, ctx_embeds = self.biencoder(
+                    batch_input.question_ids,
+                    batch_input.question_segments,
+                    q_attn_mask,
+                    batch_input.context_ids,
+                    batch_input.ctx_segments,
+                    ctx_attn_mask
+                )
+            indexer = DenseFlatIndexer(self.biencoder.ctx_model.get_out_size())
+            assert len(ctx_embeds) == len(all_ctx_ids)
+            indexer.index_data(np.array(ctx_embeds), np.array(all_ctx_ids))
+            ctx_scores_arr, ctx_ids_arr = indexer.search_knn(np.array(q_embeds), min(cfg.DPR.SOLVER.TOP_RETRIEVE_COUNT, len(all_ctx_ids)))
+            result_list.append((qid, ctx_scores_arr[0].tolist(), ctx_ids_arr[0].tolist(), positive_ctx_ids))
+            if (i + 1) % log_result_step == 0:
+                logger.info(
+                    "Ranker Evaluation: step %d, used_time=%f sec.",
+                    i+1, time.time() - start_time
+                )
+
+        date_time = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
+        ranking_result_path = os.path.join(cfg.OUTPUT_PATH, f'rank_score_ids_{date_time}.jsonl')
+        save_ranking_results(result_list, ranking_result_path)
+        logger.info('Rank and score saved in %s', ranking_result_path)
+        metrics_dt = compute_eval_scores(result_list)
+        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics{date_time}.json')
+        save_eval_metrics(metrics_dt, eval_metrics_path)
+        logger.info('Evaluation done. Score per metric saved in %s', eval_metrics_path)
+
     def validate_nll(self) -> float:
         logger.info('NLL validation ...')
         cfg = self.cfg
         self.biencoder.eval()
         if not self.dev_iterator:
             self.dev_iterator = self.get_data_iterator(
+                dataset=self.val_dataset,
                 batch_size=cfg.DPR.SOLVER.VAL_BATCH_SIZE,
                 is_train_set=False,
                 shuffle=False
@@ -302,7 +371,7 @@ class RetrieverTrainer:
         log_result_step = cfg.DPR.SOLVER.LOG_BATCH_STEP
         batches = 0
         for i, samples_batch in enumerate(data_iterator.iterate_data()):
-            biencoder_batch = BiEncoder.create_biencoder_input(
+            batch_input = BiEncoder.create_biencoder_input(
                 samples=samples_batch,
                 tensorizer=self.tensorizer,
                 insert_title=True,
@@ -311,12 +380,12 @@ class RetrieverTrainer:
                 shuffle=False
             )
 
-            loss, correct_cnt = self._do_biencoder_fwd_pass(biencoder_batch)
+            loss, correct_cnt = self._do_biencoder_fwd_pass(batch_input)
             total_loss += loss.item()
             total_correct_predictions += correct_cnt
             batches += 1
             if (i + 1) % log_result_step == 0:
-                logger.info('Eval step: %d , used_time=%f sec., loss=%f ', i, time.time() - start_time, loss.item())
+                logger.info('Eval step: %d , used_time=%f sec., loss=%f ', i+1, time.time() - start_time, loss.item())
 
         total_loss = total_loss / batches
         total_samples = batches * cfg.DPR.SOLVER.VAL_BATCH_SIZE * self.distributed_factor
@@ -400,6 +469,7 @@ class RetrieverTrainer:
         self.biencoder.train()
         epoch_batches = train_data_iterator.max_iterations
         data_iteration = 0
+        last_saved_iteration = -1
 
         # TODO: Check this
         # biencoder = get_model_obj(self.biencoder)
@@ -469,11 +539,13 @@ class RetrieverTrainer:
                     data_iteration,
                     epoch_batches,
                 )
-                self.validate_and_save(epoch, train_data_iterator.get_iteration(), scheduler)
+                self.validate_and_save(epoch, data_iteration, scheduler)
+                last_saved_iteration = data_iteration
                 self.biencoder.train()
 
         logger.info("Epoch finished on rank %d", cfg.LOCAL_RANK)
-        self.validate_and_save(epoch, data_iteration, scheduler)
+        if last_saved_iteration != data_iteration:
+            self.validate_and_save(epoch, data_iteration, scheduler)
 
         epoch_loss = (epoch_loss / epoch_batches) if epoch_batches > 0 else 0
         logger.info("Av Loss per epoch=%f", epoch_loss)
@@ -482,6 +554,7 @@ class RetrieverTrainer:
     def train(self):
         cfg = self.cfg
         train_iterator = self.get_data_iterator(
+            dataset=self.train_dataset,
             batch_size=cfg.DPR.SOLVER.TRAIN_BATCH_SIZE,
             is_train_set=True,
             shuffle=True,
@@ -547,7 +620,10 @@ def run(cfg):
     cfg = setup_cfg_gpu(cfg)
     set_seed(cfg.SEED)
     retriever_trainer = RetrieverTrainer(cfg)
-    retriever_trainer.train()
+    if cfg.DPR.DO_TRAIN:
+        retriever_trainer.train()
+    if cfg.DPR.DO_TEST:
+        retriever_trainer.test()
 
 
 if __name__ == "__main__":
@@ -556,28 +632,33 @@ if __name__ == "__main__":
     data_path = arguments['--path_data']
     train_data_path = arguments['--path_train_data']
     val_data_path = arguments['--path_val_data']
+    test_data_path = arguments['--path_test_data']
     exp_cfg_path = arguments['--path_cfg_exp']
     config = get_cfg_defaults()
     if data_path is not None:
         config.DPR.DATA.DATA_PATH = data_path
         config.DPR.DATA.TRAIN_DATA_PATH = os.path.join(data_path, 'train.json')
         config.DPR.DATA.VAL_DATA_PATH = os.path.join(data_path, 'dev.json')
+        config.DPR.DATA.TEST_DATA_PATH = os.path.join(data_path, 'test.json')
     if train_data_path is not None:
         config.DPR.DATA.TRAIN_DATA_PATH = train_data_path
     if val_data_path is not None:
         config.DPR.DATA.VAL_DATA_PATH = val_data_path
+    if test_data_path is not None:
+        config.DPR.DATA.TEST_DATA_PATH = test_data_path
     if exp_cfg_path is not None:
         config.merge_from_file(exp_cfg_path)
     if output_path is not None:
         config.OUTPUT_PATH = output_path
 
     # Make result folders if they do not exist
-    cur_timestamp = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
-    config.OUTPUT_PATH = os.path.join(config.OUTPUT_PATH, config.EXP, cur_timestamp)
+    # cur_timestamp = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
+    # config.OUTPUT_PATH = os.path.join(config.OUTPUT_PATH, config.EXP, cur_timestamp)
     print(config.OUTPUT_PATH)
     if not os.path.exists(config.OUTPUT_PATH):
         os.makedirs(config.OUTPUT_PATH, exist_ok=False)
     config.dump(stream=open(os.path.join(config.OUTPUT_PATH, f'config_{config.EXP}.yaml'), 'w'))
     logger.info("Started logging...")
     run(config)
-    shutil.copy(src='logs.log', dst=config.OUTPUT_PATH)
+
+    shutil.copy(src='eval_logs.log', dst=config.OUTPUT_PATH)

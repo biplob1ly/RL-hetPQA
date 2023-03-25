@@ -105,7 +105,7 @@ def read_data_from_json_files(paths: List[str]) -> List:
 
 
 class BiEncoderSample:
-    # qid: str
+    qid: str
     query: str
     positive_passages: List[BiEncoderPassage]
     negative_passages: List[BiEncoderPassage]
@@ -195,6 +195,7 @@ class JsonQADataset(QADataset):
     def __getitem__(self, index) -> BiEncoderSample:
         json_sample = self.data[index]
         r = BiEncoderSample()
+        r.qid = json_sample["qid"]
         r.query = self._process_query(json_sample["question"])
 
         positive_ctxs = json_sample["positive_ctxs"]

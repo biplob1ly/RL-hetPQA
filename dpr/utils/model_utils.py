@@ -32,6 +32,9 @@ def get_model_file(cfg, file_prefix) -> str:
 
     if len(out_cp_files) > 0:
         model_file = max(out_cp_files, key=os.path.getctime)
+        logger.info('Selected file to load: %s', model_file)
+    else:
+        logger.info('No checkpoint file found at output path: %s', cfg.OUTPUT_PATH)
     return model_file
 
 

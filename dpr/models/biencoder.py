@@ -7,8 +7,7 @@ from torch import Tensor as T
 import torch.nn.functional as F
 from torch import nn
 from typing import Tuple, List
-from dpr.utils.data_utils import Tensorizer
-from dpr.utils.data_utils import normalize_question
+from dpr.utils.data_utils import Tensorizer, BiEncoderSample
 
 BiEncoderBatch = collections.namedtuple(
     'BiENcoderInput',
@@ -19,6 +18,16 @@ BiEncoderBatch = collections.namedtuple(
          'ctx_segments',
          'positive_ctx_indices',
          'hard_neg_ctx_indices'
+    ]
+)
+
+BiEncoderSingle = collections.namedtuple(
+    'BiENcoderSingle',
+    [
+        'question_ids',
+         'question_segments',
+         'context_ids',
+         'ctx_segments'
     ]
 )
 
@@ -123,6 +132,48 @@ class BiEncoder(nn.Module):
                                                                         ctx_attn_mask, self.fix_ctx_encoder)
 
         return q_pooled_out, ctx_pooled_out
+
+    @classmethod
+    def create_biencoder_single(cls,
+                                sample: BiEncoderSample,
+                                tensorizer: Tensorizer,
+                                insert_title: bool = False
+                                ) -> Tuple:
+        """
+        Creates a batch of the biencoder training tuple.
+        :param sample: list of data items (from json) to create the batch for
+        :param tensorizer: components to create model input tensors from a text sequence
+        :param insert_title: enables title insertion at the beginning of the context sequences
+        :return: tuple
+        """
+        qid = sample.qid
+        question = sample.query
+        positive_ctxs = sample.positive_passages
+        positive_ctx_ids = [ctx.cid for ctx in positive_ctxs]
+        neg_ctxs = sample.negative_passages
+        hard_neg_ctxs = sample.hard_negative_passages
+        all_ctxs = positive_ctxs + neg_ctxs + hard_neg_ctxs
+        all_ctx_ids, all_ctx_tensors = [], []
+        for ctx in all_ctxs:
+            all_ctx_ids.append(ctx.cid)
+            all_ctx_tensors.append(
+                tensorizer.text_to_tensor(
+                    text=ctx.text,
+                    title=ctx.title if (insert_title and ctx.title) else None
+                )
+            )
+        questions_tensor = tensorizer.text_to_tensor(question).unsqueeze(0)
+        ctxs_tensor = torch.cat([ctx.view(1, -1) for ctx in all_ctx_tensors], dim=0)
+
+        ctx_segments = torch.zeros_like(ctxs_tensor)
+        question_segments = torch.zeros_like(questions_tensor)
+
+        return qid, all_ctx_ids, positive_ctx_ids, BiEncoderSingle(
+            questions_tensor,
+            question_segments,
+            ctxs_tensor,
+            ctx_segments
+        )
 
     @classmethod
     def create_biencoder_input(cls,

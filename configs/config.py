@@ -47,6 +47,8 @@ _C.FP16_OPT_LEVEL = 'O1'
 
 
 _C.DPR = CfgNode()
+_C.DPR.DO_TRAIN = True
+_C.DPR.DO_TEST = True
 # -----------------------------------------------------------------------------
 # DPR.DATA
 # -----------------------------------------------------------------------------
@@ -57,7 +59,7 @@ _C.DPR.DATA.TRAIN_DATA_PATH = '../data/train.json'
 _C.DPR.DATA.VAL_DATA_PATH = '../data/dev.json'
 _C.DPR.DATA.TEST_DATA_PATH = '../data/test.json'
 _C.DPR.DATA.HARD_NEGATIVES = 1
-_C.DPR.DATA.OTHER_NEGATIVES = 1
+_C.DPR.DATA.OTHER_NEGATIVES = 5
 _C.DPR.DATA.NORMALIZE = True
 _C.DPR.DATA.FLATTEN_ATTRIBUTE = True
 
@@ -85,6 +87,7 @@ _C.DPR.MODEL.FIX_CTX_ENCODER = False
 _C.DPR.SOLVER = CfgNode()
 _C.DPR.SOLVER.TRAIN_BATCH_SIZE = 2
 _C.DPR.SOLVER.VAL_BATCH_SIZE = 4
+_C.DPR.SOLVER.TEST_BATCH_SIZE = 1
 _C.DPR.SOLVER.NUM_TRAIN_EPOCH = 2
 _C.DPR.SOLVER.EVAL_PER_EPOCH = 1
 _C.DPR.SOLVER.CP_SAVE_LIMIT = 3
@@ -95,6 +98,7 @@ _C.DPR.SOLVER.VAL_AV_RANK_BSZ = 128
 _C.DPR.SOLVER.VAL_AV_RANK_MAX_QS = 1000
 # Logging interval in terms of batches
 _C.DPR.SOLVER.LOG_BATCH_STEP = 2
+_C.DPR.SOLVER.LOG_TEST_STEP = 100
 _C.DPR.SOLVER.TRAIN_ROLLING_LOSS_STEP = 2
 
 _C.DPR.SOLVER.DROPOUT = 0.1
@@ -110,6 +114,11 @@ _C.DPR.SOLVER.OPTIMIZER.EPS = 1e-8
 _C.DPR.SOLVER.OPTIMIZER.WEIGHT_DECAY = 0.0
 _C.DPR.SOLVER.OPTIMIZER.BETAS = (0.9, 0.999)
 _C.DPR.SOLVER.OPTIMIZER.RESET = False
+
+# Amount of top docs to return
+_C.DPR.SOLVER.TOP_RETRIEVE_COUNT = 5
+# Temporal memory data buffer size (in samples) for indexer
+_C.DPR.SOLVER.INDEX_BUFFER_SIZE = 500
 
 
 def get_cfg_defaults():
