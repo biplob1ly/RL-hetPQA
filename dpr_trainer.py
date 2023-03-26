@@ -38,7 +38,7 @@ from dpr.utils.model_utils import (
 from dpr.options import set_encoder_params_from_state, get_encoder_params_state, setup_cfg_gpu, set_seed
 from dpr.utils.data_utils import JsonQADataset, SharedDataIterator
 from dpr.indexer.faiss_indexers import DenseFlatIndexer
-from utils import save_ranking_results, save_eval_metrics, compute_eval_scores
+from utils import save_ranking_results, save_eval_metrics, compute_metrics_from_rank_file
 
 logging.basicConfig(
     filename='eval_logs.log',
@@ -329,9 +329,11 @@ class RetrieverTrainer:
                     ctx_attn_mask
                 )
             indexer = DenseFlatIndexer(self.biencoder.ctx_model.get_out_size())
+            q_embeds = q_embeds.cpu().numpy()
+            ctx_embeds = ctx_embeds.cpu().numpy()
             assert len(ctx_embeds) == len(all_ctx_ids)
-            indexer.index_data(np.array(ctx_embeds), np.array(all_ctx_ids))
-            ctx_scores_arr, ctx_ids_arr = indexer.search_knn(np.array(q_embeds), min(cfg.DPR.SOLVER.TOP_RETRIEVE_COUNT, len(all_ctx_ids)))
+            indexer.index_data(ctx_embeds, np.array(all_ctx_ids))
+            ctx_scores_arr, ctx_ids_arr = indexer.search_knn(q_embeds, len(all_ctx_ids))
             result_list.append((qid, ctx_scores_arr[0].tolist(), ctx_ids_arr[0].tolist(), positive_ctx_ids))
             if (i + 1) % log_result_step == 0:
                 logger.info(
@@ -339,14 +341,7 @@ class RetrieverTrainer:
                     i+1, time.time() - start_time
                 )
 
-        date_time = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
-        ranking_result_path = os.path.join(cfg.OUTPUT_PATH, f'rank_score_ids_{date_time}.jsonl')
-        save_ranking_results(result_list, ranking_result_path)
-        logger.info('Rank and score saved in %s', ranking_result_path)
-        metrics_dt = compute_eval_scores(result_list)
-        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics{date_time}.json')
-        save_eval_metrics(metrics_dt, eval_metrics_path)
-        logger.info('Evaluation done. Score per metric saved in %s', eval_metrics_path)
+        return result_list
 
     def validate_nll(self) -> float:
         logger.info('NLL validation ...')
@@ -618,7 +613,15 @@ def run(cfg):
     if cfg.DPR.DO_TRAIN:
         retriever_trainer.train()
     if cfg.DPR.DO_TEST:
-        retriever_trainer.test()
+        result_list = retriever_trainer.test()
+        date_time = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
+        ranking_result_path = os.path.join(cfg.OUTPUT_PATH, f'rank_score_ids_{date_time}.jsonl')
+        save_ranking_results(result_list, ranking_result_path)
+        logger.info('Rank and score saved in %s', ranking_result_path)
+        metrics_dt = compute_metrics_from_rank_file(ranking_result_path)
+        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics_{date_time}.json')
+        save_eval_metrics(metrics_dt, eval_metrics_path)
+        logger.info('Evaluation done. Score per metric saved in %s', eval_metrics_path)
 
 
 if __name__ == "__main__":

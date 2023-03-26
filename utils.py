@@ -2,6 +2,7 @@ import os
 import re
 import json
 import csv
+from ranx import Qrels, Run, evaluate, compare
 
 
 def save_ranking_results(result_list, ranking_result_path):
@@ -16,6 +17,22 @@ def save_ranking_results(result_list, ranking_result_path):
 def save_eval_metrics(metrics_dt, eval_metrics_path):
     with open(eval_metrics_path, 'w') as fout:
         json.dump(metrics_dt, fout, indent=4)
+
+
+def compute_metrics_from_rank_file(file_path):
+    qrels_dt = {}
+    run_dt = {}
+    with open(file_path, 'r') as fin:
+        for line in fin:
+            q_json = json.loads(line.strip())
+            qrels_dt[q_json['qid']] = {str(ctx_id): 1 for ctx_id in q_json['actual_ctx_ids']}
+            run_dt[q_json['qid']] = {str(ctx_id): score for ctx_id, score in zip(q_json['pred_ctx_ids'], q_json['scores'])}
+    qrels = Qrels(qrels_dt)
+    run = Run(run_dt)
+    score_dict = evaluate(qrels, run,
+                          ["map", "map@1", "map@3", "map@5", "mrr", "r-precision", "precision@1", "precision@3",
+                           "precision@5", "recall@1", "recall@3", "recall@5", "f1@1", "f1@3", "f1@5", "ndcg", "hits@5"])
+    return score_dict
 
 
 def precision_recall_at_k(ranked_items, k):
@@ -88,15 +105,15 @@ def MAP_at_k(ranked_items, k):
     ap_at_k = []
     for _, _, pred_ctx_ids, act_ctx_ids in ranked_items:
         if len(pred_ctx_ids) >= k:
-            ap = 0
+            ap = []
+            act_set = set(act_ctx_ids)
             for x in range(k):
-                act_set = set(act_ctx_ids)
                 pred_set = set(pred_ctx_ids[:x+1])
                 if pred_ctx_ids[x] in act_set:
                     true_positive = (act_set & pred_set)
                     prec_at_k = len(true_positive) / (x+1)
-                    ap += prec_at_k
-            ap_q = ap / len(act_ctx_ids)
+                    ap.append(prec_at_k)
+            ap_q = sum(ap) / len(act_ctx_ids)
             ap_at_k.append(ap_q)
     count = len(ap_at_k)
     mean_ap = sum(ap_at_k)/count if count else None
