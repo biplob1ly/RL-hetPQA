@@ -38,7 +38,7 @@ from dpr.utils.model_utils import (
 from dpr.options import set_encoder_params_from_state, get_encoder_params_state, setup_cfg_gpu, set_seed
 from dpr.utils.data_utils import JsonQADataset, SharedDataIterator
 from dpr.indexer.faiss_indexers import DenseFlatIndexer
-from utils import save_ranking_results, save_eval_metrics, compute_metrics_from_rank_file
+from utils import save_ranking_results, save_eval_metrics, compute_metrics, DPRTrainerRun, format_dpr_run
 
 logging.basicConfig(
     filename='eval_logs.log',
@@ -73,9 +73,9 @@ class RetrieverTrainer:
         self.tensorizer = tensorizer
         self.start_epoch = 0
         self.start_batch = 0
-        self.top_cp_scores = []
         self.scheduler_state = None
-        self.best_validation_result = None
+        self.runs = []
+        self.saved_cps = {}
         self.best_cp_name = None
         if cfg.DPR.DO_TRAIN:
             self.train_dataset = JsonQADataset(cfg.DPR.DATA.TRAIN_DATA_PATH,
@@ -85,10 +85,6 @@ class RetrieverTrainer:
             self.val_dataset = JsonQADataset(cfg.DPR.DATA.VAL_DATA_PATH,
                                              normalize=cfg.DPR.DATA.NORMALIZE,
                                              flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
-        if cfg.DPR.DO_TEST:
-            self.test_dataset = JsonQADataset(cfg.DPR.DATA.TEST_DATA_PATH,
-                                              normalize=cfg.DPR.DATA.NORMALIZE,
-                                              flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
         self.loss_function = BiEncoderNllLoss()
         if saved_state:
             strict = True if cfg.DPR.MODEL.PROJECTION_DIM == 0 else False
@@ -296,13 +292,12 @@ class RetrieverTrainer:
         logger.info('Av.rank validation: average rank %s, total questions=%d', av_rank, q_num)
         return av_rank
 
-    def test(self):
+    def evaluate(self, dataset: JsonQADataset):
         logger.info('Evaluating ranker ...')
         cfg = self.cfg
         self.biencoder.eval()
-        distributed_factor = self.distributed_factor
         test_iterator = self.get_data_iterator(
-                dataset=self.test_dataset,
+                dataset=dataset,
                 batch_size=cfg.DPR.SOLVER.TEST_BATCH_SIZE,
                 shuffle=False
         )
@@ -311,7 +306,7 @@ class RetrieverTrainer:
         result_list = []
         for i, samples_batch in enumerate(test_iterator.iterate_data()):
             # Do not shuffle test positives/negatives
-            qid, all_ctx_ids, positive_ctx_ids, single_input = BiEncoder.create_biencoder_single(
+            all_ctx_ids, positive_ctx_ids, single_input = BiEncoder.create_biencoder_single(
                 sample=samples_batch[0],
                 tensorizer=self.tensorizer,
                 insert_title=True
@@ -334,7 +329,15 @@ class RetrieverTrainer:
             assert len(ctx_embeds) == len(all_ctx_ids)
             indexer.index_data(ctx_embeds, np.array(all_ctx_ids))
             ctx_scores_arr, ctx_ids_arr = indexer.search_knn(q_embeds, len(all_ctx_ids))
-            result_list.append((qid, ctx_scores_arr[0].tolist(), ctx_ids_arr[0].tolist(), positive_ctx_ids))
+            result_list.append(
+                {
+                    'qid': samples_batch[0].qid,
+                    'source': samples_batch[0].source,
+                    'scores': ctx_scores_arr[0].tolist(),
+                    'pred_ctx_ids': ctx_ids_arr[0].tolist(),
+                    'actual_ctx_ids': positive_ctx_ids
+                }
+            )
             if (i + 1) % log_result_step == 0:
                 logger.info(
                     "Ranker Evaluation: step %d, used_time=%f sec.",
@@ -415,30 +418,39 @@ class RetrieverTrainer:
         # for distributed mode, save checkpoint for only one process
         save_cp = cfg.LOCAL_RANK in [-1, 0]
 
-        # if epoch == cfg.DPR.SOLVER.VAL_AV_RANK_START_EPOCH:
-        #     self.best_validation_result = None
-
+        cur_run_id = len(self.runs)
         if cfg.DPR.DATA.VAL_DATA_PATH:
-            if epoch >= cfg.DPR.SOLVER.VAL_AV_RANK_START_EPOCH:
-                validation_loss = self.validate_average_rank()
-            else:
-                validation_loss = self.validate_nll()
-        else:
-            validation_loss = 0
+            validation_loss = self.validate_nll()
+            result_list = self.evaluate(self.val_dataset)
+            val_metrics = ["map", "r-precision", "mrr", "ndcg", "hit_rate@5", "precision@1"]
+            metrics_dt = compute_metrics(result_list, val_metrics)['all']
+            metrics_score = [metrics_dt[metric] for metric in val_metrics]
+            cur_run = DPRTrainerRun(cur_run_id, epoch, iteration, validation_loss, val_metrics, metrics_score)
+            self.runs.append(cur_run)
+            fmt_header, fmt_value = format_dpr_run(cur_run)
+            logger.info(fmt_header)
+            logger.info(fmt_value)
+            if cur_run_id == 0:
+                print(fmt_header)
+            print(fmt_value)
 
         if save_cp:
-            if len(self.top_cp_scores) < cfg.DPR.SOLVER.CP_SAVE_LIMIT:
+            best_run = max(self.runs, key=lambda x: x.metrics_score)
+            if len(self.saved_cps) < cfg.DPR.SOLVER.CP_SAVE_LIMIT:
                 cp_path = self._save_checkpoint(scheduler, epoch, iteration)
-                heapq.heappush(self.top_cp_scores, (-validation_loss, cp_path))
-                if max(self.top_cp_scores)[1] == cp_path:
+                self.saved_cps[cur_run_id] = cp_path
+                if best_run.run_id == cur_run_id:
                     logger.info('New Best validation checkpoint %s', cp_path)
-            elif validation_loss < -self.top_cp_scores[0][0]:
-                _, cp_path_to_delete = heapq.heappop(self.top_cp_scores)
-                os.remove(cp_path_to_delete)
-                cp_path = self._save_checkpoint(scheduler, epoch, iteration)
-                heapq.heappush(self.top_cp_scores, (-validation_loss, cp_path))
-                if max(self.top_cp_scores)[1] == cp_path:
-                    logger.info('New Best validation checkpoint %s', cp_path)
+            else:
+                sorted_runs = sorted(self.runs, key=lambda x: x.metrics_score)
+                for dpr_run in sorted_runs[cfg.DPR.SOLVER.CP_SAVE_LIMIT:]:
+                    if dpr_run.run_id in self.saved_cps:
+                        os.remove(self.saved_cps[dpr_run.run_id])
+                        del self.saved_cps[dpr_run.run_id]
+                        cp_path = self._save_checkpoint(scheduler, epoch, iteration)
+                        self.saved_cps[cur_run_id] = cp_path
+                        if best_run.run_id == cur_run_id:
+                            logger.info('New Best validation checkpoint %s', cp_path)
 
     def _train_epoch(
         self,
@@ -575,10 +587,11 @@ class RetrieverTrainer:
             self._train_epoch(scheduler, epoch, eval_step, train_iterator)
 
         if cfg.LOCAL_RANK in [-1, 0]:
-            logger.info('validation loss\tcp_path ')
-            for neg_val_loss, cp_path in sorted(self.top_cp_scores, reverse=True):
-                print(f'{-neg_val_loss:<15.5f}\t{cp_path}')
-                logger.info(f'{-neg_val_loss:<15.5f}\t{cp_path}')
+            for idx, dpr_run in enumerate(self.runs):
+                fmt_header, fmt_value = format_dpr_run(dpr_run)
+                if idx == 0:
+                    logger.info(fmt_header)
+                logger.info(fmt_value)
             logger.info("Training finished. Best validation checkpoint %s", self.best_cp_name)
 
     def _load_saved_state(self, saved_state: CheckpointState, strict=True):
@@ -613,13 +626,19 @@ def run(cfg):
     if cfg.DPR.DO_TRAIN:
         retriever_trainer.train()
     if cfg.DPR.DO_TEST:
-        result_list = retriever_trainer.test()
+        test_dataset = JsonQADataset(cfg.DPR.DATA.TEST_DATA_PATH,
+                                     normalize=cfg.DPR.DATA.NORMALIZE,
+                                     flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
+        result_list = retriever_trainer.evaluate(test_dataset)
         date_time = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
         ranking_result_path = os.path.join(cfg.OUTPUT_PATH, f'rank_score_ids_{date_time}.jsonl')
         save_ranking_results(result_list, ranking_result_path)
         logger.info('Rank and score saved in %s', ranking_result_path)
-        metrics_dt = compute_metrics_from_rank_file(ranking_result_path)
-        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics_{date_time}.json')
+        eval_metrics = ["map", "r-precision", "mrr", "ndcg", "hit_rate@5", "precision@1",
+                        "hits@5", "precision@3", "precision@5", "map@1", "map@3",
+                        "map@5", "recall@1", "recall@3", "recall@5", "f1@1", "f1@3", "f1@5"]
+        metrics_dt = compute_metrics(result_list, eval_metrics)
+        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics_{date_time}')
         save_eval_metrics(metrics_dt, eval_metrics_path)
         logger.info('Evaluation done. Score per metric saved in %s', eval_metrics_path)
 
@@ -650,12 +669,12 @@ if __name__ == "__main__":
         config.OUTPUT_PATH = output_path
 
     # Make result folders if they do not exist
-    # cur_timestamp = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
-    # config.OUTPUT_PATH = os.path.join(config.OUTPUT_PATH, config.EXP, cur_timestamp)
-    print(config.OUTPUT_PATH)
+    cur_timestamp = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
+    config.OUTPUT_PATH = os.path.join(config.OUTPUT_PATH, config.EXP, cur_timestamp)
+    print(f'Output path: {config.OUTPUT_PATH}')
     if not os.path.exists(config.OUTPUT_PATH):
         os.makedirs(config.OUTPUT_PATH, exist_ok=False)
-    config.dump(stream=open(os.path.join(config.OUTPUT_PATH, f'config_{config.EXP}.yaml'), 'w'))
     logger.info("Started logging...")
     run(config)
+    config.dump(stream=open(os.path.join(config.OUTPUT_PATH, f'config_{config.EXP}.yaml'), 'w'))
     shutil.copy(src='eval_logs.log', dst=config.OUTPUT_PATH)

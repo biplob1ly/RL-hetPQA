@@ -1,37 +1,74 @@
-import os
-import re
+import collections
 import json
-import csv
+import pandas as pd
 from ranx import Qrels, Run, evaluate, compare
+
+
+DPRTrainerRun = collections.namedtuple(
+    'DPRTrainerRun',
+    [
+        "run_id",
+        "epoch",
+        "iteration",
+        "val_loss",
+        "metrics",
+        "scores"
+    ]
+)
+
+
+def format_dpr_run(dpr_run: DPRTrainerRun):
+    header = ['run_id', 'epoch', 'iteration', 'val_loss'] + dpr_run.metrics
+    fmt_header = ' | '.join([f"{item:->10}" for item in header])
+    values = [dpr_run.run_id, dpr_run.epoch, dpr_run.iteration, dpr_run.val_loss] + dpr_run.scores
+    fmt_value = ' | '.join([f"{item: >10.5f}" for item in values])
+    return fmt_header, fmt_value
 
 
 def save_ranking_results(result_list, ranking_result_path):
     with open(ranking_result_path, 'w') as fout:
-        names = ['qid', 'scores', 'pred_ctx_ids', 'actual_ctx_ids']
-        for vals in result_list:
-            dt = dict(zip(names, vals))
-            json_line = json.dumps(dt)
+        for val_dt in result_list:
+            json_line = json.dumps(val_dt)
             fout.write(json_line+'\n')
 
 
 def save_eval_metrics(metrics_dt, eval_metrics_path):
-    with open(eval_metrics_path, 'w') as fout:
+    with open(eval_metrics_path + '.json', 'w') as fout:
         json.dump(metrics_dt, fout, indent=4)
 
+    col_dt = collections.defaultdict(list)
+    for source, dt in metrics_dt.items():
+        col_dt['source'].append(source)
+        for metric, score in dt.items():
+            col_dt[metric].append(score)
+    df = pd.DataFrame(col_dt)
+    with open(eval_metrics_path + '.csv', 'w') as fout:
+        df.to_csv(fout, index=False)
 
-def compute_metrics_from_rank_file(file_path):
-    qrels_dt = {}
-    run_dt = {}
-    with open(file_path, 'r') as fin:
-        for line in fin:
-            q_json = json.loads(line.strip())
-            qrels_dt[q_json['qid']] = {str(ctx_id): 1 for ctx_id in q_json['actual_ctx_ids']}
-            run_dt[q_json['qid']] = {str(ctx_id): score for ctx_id, score in zip(q_json['pred_ctx_ids'], q_json['scores'])}
-    qrels = Qrels(qrels_dt)
-    run = Run(run_dt)
-    score_dict = evaluate(qrels, run,
-                          ["map", "map@1", "map@3", "map@5", "mrr", "r-precision", "precision@1", "precision@3",
-                           "precision@5", "recall@1", "recall@3", "recall@5", "f1@1", "f1@3", "f1@5", "ndcg", "hits@5"])
+
+def compute_metrics(result_list, metrics):
+    sources = ['all', "attribute", "bullet", "OSP", "Desc", "review", "CQA"]
+    qrels_dt = {source: {} for source in sources}
+    run_dt = {source: {} for source in sources}
+    count = 0
+    for q_dt in result_list:
+        ctx_act_score = {str(ctx_id): 1 for ctx_id in q_dt['actual_ctx_ids']}
+        ctx_pred_score = {str(ctx_id): score for ctx_id, score in zip(q_dt['pred_ctx_ids'], q_dt['scores'])}
+
+        unq_qid = q_dt['qid'] + '_' + str(count)
+        qrels_dt[q_dt['source']][unq_qid] = ctx_act_score
+        run_dt[q_dt['source']][unq_qid] = ctx_pred_score
+
+        qrels_dt['all'][unq_qid] = ctx_act_score
+        run_dt['all'][unq_qid] = ctx_pred_score
+        count += 1
+
+    score_dict = {}
+    for source in sources:
+        qrels = Qrels(qrels_dt[source])
+        run = Run(run_dt[source])
+        score_dict[source] = evaluate(qrels, run, metrics)
+        score_dict[source]['count'] = len(qrels_dt[source])
     return score_dict
 
 

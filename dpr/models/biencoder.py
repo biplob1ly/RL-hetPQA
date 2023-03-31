@@ -146,7 +146,6 @@ class BiEncoder(nn.Module):
         :param insert_title: enables title insertion at the beginning of the context sequences
         :return: tuple
         """
-        qid = sample.qid
         question = sample.query
         positive_ctxs = sample.positive_passages
         positive_ctx_ids = [ctx.cid for ctx in positive_ctxs]
@@ -168,7 +167,7 @@ class BiEncoder(nn.Module):
         ctx_segments = torch.zeros_like(ctxs_tensor)
         question_segments = torch.zeros_like(questions_tensor)
 
-        return qid, all_ctx_ids, positive_ctx_ids, BiEncoderSingle(
+        return all_ctx_ids, positive_ctx_ids, BiEncoderSingle(
             questions_tensor,
             question_segments,
             ctxs_tensor,
