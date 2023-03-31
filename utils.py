@@ -21,7 +21,7 @@ def format_dpr_run(dpr_run: DPRTrainerRun):
     header = ['run_id', 'epoch', 'iteration', 'val_loss'] + dpr_run.metrics
     fmt_header = ' | '.join([f"{item:->10}" for item in header])
     values = [dpr_run.run_id, dpr_run.epoch, dpr_run.iteration, dpr_run.val_loss] + dpr_run.scores
-    fmt_value = ' | '.join([f"{item: >10.5f}" for item in values])
+    fmt_value = f"{values[0]: >10}" + ' | ' + ' | '.join([f"{item: >10.5f}" for item in values[1:]])
     return fmt_header, fmt_value
 
 

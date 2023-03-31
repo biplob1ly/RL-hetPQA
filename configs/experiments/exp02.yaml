@@ -1,7 +1,7 @@
 EXP: 'exp02'
 DPR:
   DO_TRAIN: True
-  DO_TEST: True
+  DO_TEST: False
   DATA:
     NORMALIZE: True
     FLATTEN_ATTRIBUTE: True

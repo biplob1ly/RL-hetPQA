@@ -41,7 +41,7 @@ from dpr.indexer.faiss_indexers import DenseFlatIndexer
 from utils import save_ranking_results, save_eval_metrics, compute_metrics, DPRTrainerRun, format_dpr_run
 
 logging.basicConfig(
-    filename='eval_logs.log',
+    filename='logs.log',
     filemode='w',
     format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
     datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
@@ -222,7 +222,6 @@ class RetrieverTrainer:
             ctxs_ids = batch_input.context_ids
             ctxs_segments = batch_input.ctx_segments
             bsz = ctxs_ids.size(0)
-            print(bsz, sub_batch_size)
 
             # split contexts batch into sub batches since it is supposed to be too large to be processed in one batch
             for j, batch_start in enumerate(range(0, bsz, sub_batch_size)):
@@ -435,14 +434,15 @@ class RetrieverTrainer:
             print(fmt_value)
 
         if save_cp:
-            best_run = max(self.runs, key=lambda x: x.metrics_score)
+            best_run = max(self.runs, key=lambda x: x.scores)
             if len(self.saved_cps) < cfg.DPR.SOLVER.CP_SAVE_LIMIT:
                 cp_path = self._save_checkpoint(scheduler, epoch, iteration)
                 self.saved_cps[cur_run_id] = cp_path
                 if best_run.run_id == cur_run_id:
+                    self.best_cp_name = cp_path
                     logger.info('New Best validation checkpoint %s', cp_path)
             else:
-                sorted_runs = sorted(self.runs, key=lambda x: x.metrics_score)
+                sorted_runs = sorted(self.runs, key=lambda x: x.scores)
                 for dpr_run in sorted_runs[cfg.DPR.SOLVER.CP_SAVE_LIMIT:]:
                     if dpr_run.run_id in self.saved_cps:
                         os.remove(self.saved_cps[dpr_run.run_id])
@@ -450,6 +450,7 @@ class RetrieverTrainer:
                         cp_path = self._save_checkpoint(scheduler, epoch, iteration)
                         self.saved_cps[cur_run_id] = cp_path
                         if best_run.run_id == cur_run_id:
+                            self.best_cp_name = cp_path
                             logger.info('New Best validation checkpoint %s', cp_path)
 
     def _train_epoch(
@@ -472,6 +473,7 @@ class RetrieverTrainer:
         self.biencoder.train()
         epoch_batches = train_data_iterator.max_iterations
         data_iteration = 0
+        step_count = 0
         last_saved_iteration = -1
 
         # TODO: Check this
@@ -508,15 +510,16 @@ class RetrieverTrainer:
                 if cfg.DPR.SOLVER.MAX_GRAD_NORM > 0:
                     torch.nn.utils.clip_grad_norm_(self.biencoder.parameters(), cfg.DPR.SOLVER.MAX_GRAD_NORM)
 
-            if (i + 1) % cfg.DPR.SOLVER.GRADIENT_ACCUMULATION_STEPS == 0:
+            if (i+1) % cfg.DPR.SOLVER.GRADIENT_ACCUMULATION_STEPS == 0:
                 self.optimizer.step()
                 scheduler.step()
                 self.biencoder.zero_grad()
+                step_count += 1
 
-            if i % log_result_step == 0:
+            if step_count % log_result_step == 0:
                 lr = self.optimizer.param_groups[0]["lr"]
                 logger.info(
-                    "Epoch: %d: Step: %d/%d, loss=%f, lr=%f",
+                    "Epoch: %d: iteration: %d/%d, loss=%f, lr=%f",
                     epoch,
                     data_iteration,
                     epoch_batches,
@@ -524,7 +527,7 @@ class RetrieverTrainer:
                     lr,
                 )
 
-            if (i + 1) % rolling_loss_step == 0:
+            if step_count % rolling_loss_step == 0:
                 logger.info("Train batch %d", data_iteration)
                 latest_rolling_train_av_loss = rolling_train_loss / rolling_loss_step
                 logger.info(
@@ -534,17 +537,17 @@ class RetrieverTrainer:
                 )
                 rolling_train_loss = 0.0
 
-            if data_iteration % eval_step == 0:
-                logger.info(
-                    "rank=%d, Validation: Epoch: %d Step: %d/%d",
-                    cfg.LOCAL_RANK,
-                    epoch,
-                    data_iteration,
-                    epoch_batches,
-                )
-                self.validate_and_save(epoch, data_iteration, scheduler)
-                last_saved_iteration = data_iteration
-                self.biencoder.train()
+            # if step_count % eval_step == 0:
+            #     logger.info(
+            #         "rank=%d, Validation: Epoch: %d iteration: %d/%d",
+            #         cfg.LOCAL_RANK,
+            #         epoch,
+            #         data_iteration,
+            #         epoch_batches,
+            #     )
+            #     self.validate_and_save(epoch, data_iteration, scheduler)
+            #     last_saved_iteration = data_iteration
+            #     self.biencoder.train()
 
         logger.info("Epoch finished on rank %d", cfg.LOCAL_RANK)
         if last_saved_iteration != data_iteration:
@@ -677,4 +680,4 @@ if __name__ == "__main__":
     logger.info("Started logging...")
     run(config)
     config.dump(stream=open(os.path.join(config.OUTPUT_PATH, f'config_{config.EXP}.yaml'), 'w'))
-    shutil.copy(src='eval_logs.log', dst=config.OUTPUT_PATH)
+    shutil.copy(src='logs.log', dst=config.OUTPUT_PATH)
