@@ -26,7 +26,7 @@ def get_model_file(cfg, file_prefix) -> str:
     if cfg.DPR.MODEL.MODEL_FILE and os.path.exists(cfg.DPR.MODEL.MODEL_FILE):
         return cfg.DPR.MODEL.MODEL_FILE
 
-    out_cp_files = glob.glob(os.path.join(cfg.OUTPUT_PATH, file_prefix + "*")) if cfg.OUTPUT_PATH else []
+    out_cp_files = glob.glob(os.path.join(cfg.DPR.MODEL.MODEL_PATH, file_prefix + "*")) if cfg.DPR.MODEL.MODEL_PATH else []
     logger.info("Checkpoint files %s", out_cp_files)
     model_file = None
 
@@ -34,7 +34,7 @@ def get_model_file(cfg, file_prefix) -> str:
         model_file = max(out_cp_files, key=os.path.getctime)
         logger.info('Selected file to load: %s', model_file)
     else:
-        logger.info('No checkpoint file found at output path: %s', cfg.OUTPUT_PATH)
+        logger.info('No checkpoint file found at model path: %s', cfg.DPR.MODEL.MODEL_PATH)
     return model_file
 
 

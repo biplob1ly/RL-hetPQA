@@ -1,17 +1,20 @@
 """
 train model
 Usage:
-    dpr_trainer.py --path_output=<path> --path_data=<path> [--path_train_data=<path>] [--path_val_data=<path>] [--path_test_data=<path>] [--path_cfg_exp=<path>]
+    dpr_trainer.py  --path_cfg_exp=<path> [--path_data=<path>] [--path_model=<path>] [--path_output=<path>] [--version=<val>] [--dpr_ckpt=<filename>]
     dpr_trainer.py -h | --help
 
 Options:
     -h --help                   show this screen help
-    --path_output=<path>        output path
+    --path_cfg_exp=<path>       experiment config path
     --path_data=<path>          data path
+    --path_model=<path>         model path
+    --path_output=<path>        output path
     --path_train_data=<path>    train data path
     --path_val_data=<path>      validation data path
     --path_test_data=<path>     Test data path
-    --path_cfg_exp=<path>       experiment config path
+    --version=<val>             version
+    --dpr_ckpt=<filename>       DPR checkpoint file name
 """
 from docopt import docopt
 import os
@@ -49,14 +52,13 @@ logger = logging.getLogger(__name__)
 
 
 class RetrieverTrainer:
-    def __init__(self, cfg):
+    def __init__(self, cfg, model_file=None):
         self.cfg = cfg
         self.shard_id = cfg.LOCAL_RANK if cfg.LOCAL_RANK != -1 else 0
         self.distributed_factor = cfg.DISTRIBUTED_WORLD_SIZE or 1
 
-        logger.info("***** Initializing components for training *****")
+        logger.info("***** Initializing model components *****")
         # if model file is specified, encoder parameters from saved state should be used for initialization
-        model_file = get_model_file(cfg, cfg.DPR.MODEL.CHECKPOINT_FILE_NAME)
         saved_state = None
         if model_file:
             saved_state = load_states_from_checkpoint(model_file)
@@ -77,18 +79,12 @@ class RetrieverTrainer:
         self.runs = []
         self.saved_cps = {}
         self.best_cp_name = None
-        if cfg.DPR.DO_TRAIN:
-            self.train_dataset = JsonQADataset(cfg.DPR.DATA.TRAIN_DATA_PATH,
-                                               shuffle_positives=True,
-                                               normalize=cfg.DPR.DATA.NORMALIZE,
-                                               flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
-            self.val_dataset = JsonQADataset(cfg.DPR.DATA.VAL_DATA_PATH,
-                                             normalize=cfg.DPR.DATA.NORMALIZE,
-                                             flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
         self.loss_function = BiEncoderNllLoss()
         if saved_state:
             strict = True if cfg.DPR.MODEL.PROJECTION_DIM == 0 else False
             self._load_saved_state(saved_state, strict=strict)
+        self.train_dataset = None
+        self.val_dataset = None
         self.dev_iterator = None
 
     def get_data_iterator(
@@ -395,7 +391,7 @@ class RetrieverTrainer:
     def _save_checkpoint(self, scheduler, epoch: int, offset: int) -> str:
         cfg = self.cfg
         model_to_save = get_model_obj(self.biencoder)
-        cp = os.path.join(cfg.OUTPUT_PATH,
+        cp = os.path.join(cfg.DPR.MODEL.MODEL_PATH,
                           cfg.DPR.MODEL.CHECKPOINT_FILE_NAME + '.' + str(epoch) + ('.' + str(offset) if offset > 0 else ''))
 
         meta_params = get_encoder_params_state(cfg)
@@ -417,19 +413,19 @@ class RetrieverTrainer:
         # for distributed mode, save checkpoint for only one process
         save_cp = cfg.LOCAL_RANK in [-1, 0]
 
-        cur_run_id = len(self.runs)
+        cur_val_id = len(self.runs)
         if cfg.DPR.DATA.VAL_DATA_PATH:
             validation_loss = self.validate_nll()
             result_list = self.evaluate(self.val_dataset)
             val_metrics = ["map", "r-precision", "mrr", "ndcg", "hit_rate@5", "precision@1"]
             metrics_dt = compute_metrics(result_list, val_metrics)['all']
             metrics_score = [metrics_dt[metric] for metric in val_metrics]
-            cur_run = DPRTrainerRun(cur_run_id, epoch, iteration, validation_loss, val_metrics, metrics_score)
+            cur_run = DPRTrainerRun(cur_val_id, epoch, iteration, validation_loss, val_metrics, metrics_score)
             self.runs.append(cur_run)
             fmt_header, fmt_value = format_dpr_run(cur_run)
             logger.info(fmt_header)
             logger.info(fmt_value)
-            if cur_run_id == 0:
+            if cur_val_id == 0:
                 print(fmt_header)
             print(fmt_value)
 
@@ -437,19 +433,19 @@ class RetrieverTrainer:
             best_run = max(self.runs, key=lambda x: x.scores)
             if len(self.saved_cps) < cfg.DPR.SOLVER.CP_SAVE_LIMIT:
                 cp_path = self._save_checkpoint(scheduler, epoch, iteration)
-                self.saved_cps[cur_run_id] = cp_path
-                if best_run.run_id == cur_run_id:
+                self.saved_cps[cur_val_id] = cp_path
+                if best_run.val_id == cur_val_id:
                     self.best_cp_name = cp_path
                     logger.info('New Best validation checkpoint %s', cp_path)
             else:
                 sorted_runs = sorted(self.runs, key=lambda x: x.scores)
                 for dpr_run in sorted_runs[cfg.DPR.SOLVER.CP_SAVE_LIMIT:]:
-                    if dpr_run.run_id in self.saved_cps:
-                        os.remove(self.saved_cps[dpr_run.run_id])
-                        del self.saved_cps[dpr_run.run_id]
+                    if dpr_run.val_id in self.saved_cps:
+                        os.remove(self.saved_cps[dpr_run.val_id])
+                        del self.saved_cps[dpr_run.val_id]
                         cp_path = self._save_checkpoint(scheduler, epoch, iteration)
-                        self.saved_cps[cur_run_id] = cp_path
-                        if best_run.run_id == cur_run_id:
+                        self.saved_cps[cur_val_id] = cp_path
+                        if best_run.val_id == cur_val_id:
                             self.best_cp_name = cp_path
                             logger.info('New Best validation checkpoint %s', cp_path)
 
@@ -557,8 +553,10 @@ class RetrieverTrainer:
         logger.info("Av Loss per epoch=%f", epoch_loss)
         logger.info("epoch total correct predictions=%d", epoch_correct_predictions)
 
-    def train(self):
+    def train(self, train_dataset, val_dataset=None):
         cfg = self.cfg
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
         train_iterator = self.get_data_iterator(
             dataset=self.train_dataset,
             batch_size=cfg.DPR.SOLVER.TRAIN_BATCH_SIZE,
@@ -596,6 +594,7 @@ class RetrieverTrainer:
                     logger.info(fmt_header)
                 logger.info(fmt_value)
             logger.info("Training finished. Best validation checkpoint %s", self.best_cp_name)
+        return self.best_cp_name
 
     def _load_saved_state(self, saved_state: CheckpointState, strict=True):
         epoch = saved_state.epoch
@@ -625,59 +624,77 @@ class RetrieverTrainer:
 def run(cfg):
     cfg = setup_cfg_gpu(cfg)
     set_seed(cfg.SEED)
-    retriever_trainer = RetrieverTrainer(cfg)
+
     if cfg.DPR.DO_TRAIN:
-        retriever_trainer.train()
+        model_file = get_model_file(cfg, cfg.DPR.MODEL.CHECKPOINT_FILE_NAME)
+        retriever_trainer = RetrieverTrainer(cfg, model_file=model_file)
+        train_dataset = JsonQADataset(cfg.DPR.DATA.TRAIN_DATA_PATH,
+                                      shuffle_positives=True,
+                                      normalize=cfg.DPR.DATA.NORMALIZE,
+                                      flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
+        val_dataset = JsonQADataset(cfg.DPR.DATA.VAL_DATA_PATH,
+                                    normalize=cfg.DPR.DATA.NORMALIZE,
+                                    flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
+        best_cp_path = retriever_trainer.train(train_dataset, val_dataset=val_dataset)
+        cfg.dump(stream=open(os.path.join(cfg.DPR.MODEL.MODEL_PATH, f'config_{cfg.EXP}.yaml'), 'w'))
+        cfg.DPR.MODEL.CHECKPOINT_FILE_NAME = os.path.basename(best_cp_path)
+
     if cfg.DPR.DO_TEST:
+        model_file = get_model_file(cfg, cfg.DPR.MODEL.CHECKPOINT_FILE_NAME)
+        retriever_trainer = RetrieverTrainer(cfg, model_file=model_file)
         test_dataset = JsonQADataset(cfg.DPR.DATA.TEST_DATA_PATH,
                                      normalize=cfg.DPR.DATA.NORMALIZE,
                                      flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
         result_list = retriever_trainer.evaluate(test_dataset)
-        date_time = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
-        ranking_result_path = os.path.join(cfg.OUTPUT_PATH, f'rank_score_ids_{date_time}.jsonl')
+        ranking_result_path = os.path.join(cfg.OUTPUT_PATH, f'rank_score_ids.jsonl')
         save_ranking_results(result_list, ranking_result_path)
         logger.info('Rank and score saved in %s', ranking_result_path)
         eval_metrics = ["map", "r-precision", "mrr", "ndcg", "hit_rate@5", "precision@1",
                         "hits@5", "precision@3", "precision@5", "map@1", "map@3",
                         "map@5", "recall@1", "recall@3", "recall@5", "f1@1", "f1@3", "f1@5"]
         metrics_dt = compute_metrics(result_list, eval_metrics)
-        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics_{date_time}')
+        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics')
         save_eval_metrics(metrics_dt, eval_metrics_path)
         logger.info('Evaluation done. Score per metric saved in %s', eval_metrics_path)
 
 
 if __name__ == "__main__":
     arguments = docopt(__doc__, argv=None, help=True, version=None, options_first=False)
-    output_path = arguments['--path_output']
-    data_path = arguments['--path_data']
-    train_data_path = arguments['--path_train_data']
-    val_data_path = arguments['--path_val_data']
-    test_data_path = arguments['--path_test_data']
     exp_cfg_path = arguments['--path_cfg_exp']
+    data_path = arguments['--path_data']
+    model_path = arguments['--path_model']
+    output_path = arguments['--path_output']
+    dpr_ckpt = arguments['--dpr_ckpt']
+    version = arguments['--version']
     config = get_cfg_defaults()
+
+    logger.info("Started logging...")
+    if exp_cfg_path is not None:
+        config.merge_from_file(exp_cfg_path)
     if data_path is not None:
         config.DPR.DATA.DATA_PATH = data_path
         config.DPR.DATA.TRAIN_DATA_PATH = os.path.join(data_path, 'train.json')
         config.DPR.DATA.VAL_DATA_PATH = os.path.join(data_path, 'dev.json')
         config.DPR.DATA.TEST_DATA_PATH = os.path.join(data_path, 'test.json')
-    if train_data_path is not None:
-        config.DPR.DATA.TRAIN_DATA_PATH = train_data_path
-    if val_data_path is not None:
-        config.DPR.DATA.VAL_DATA_PATH = val_data_path
-    if test_data_path is not None:
-        config.DPR.DATA.TEST_DATA_PATH = test_data_path
-    if exp_cfg_path is not None:
-        config.merge_from_file(exp_cfg_path)
     if output_path is not None:
         config.OUTPUT_PATH = output_path
+    if dpr_ckpt is not None:
+        config.DPR.MODEL.CHECKPOINT_FILE_NAME = dpr_ckpt
+    if version is None:
+        version = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
+        logger.info(f"Version: {version}")
 
     # Make result folders if they do not exist
-    cur_timestamp = datetime.now().strftime("%d_%m_%Y-%H_%M_%S")
-    config.OUTPUT_PATH = os.path.join(config.OUTPUT_PATH, config.EXP, cur_timestamp)
-    print(f'Output path: {config.OUTPUT_PATH}')
+    config.OUTPUT_PATH = os.path.join(config.OUTPUT_PATH, config.EXP, version)
     if not os.path.exists(config.OUTPUT_PATH):
         os.makedirs(config.OUTPUT_PATH, exist_ok=False)
-    logger.info("Started logging...")
+    print(f'Output path: {config.OUTPUT_PATH}')
+    logger.info(f'Output path: {config.OUTPUT_PATH}')
+    if model_path is not None:
+        config.DPR.MODEL.MODEL_PATH = model_path
+    else:
+        config.DPR.MODEL.MODEL_PATH = config.OUTPUT_PATH
+    print(f'Model path: {config.DPR.MODEL.MODEL_PATH}')
+    logger.info(f'Model path: {config.DPR.MODEL.MODEL_PATH}')
     run(config)
-    config.dump(stream=open(os.path.join(config.OUTPUT_PATH, f'config_{config.EXP}.yaml'), 'w'))
-    shutil.copy(src='logs.log', dst=config.OUTPUT_PATH)
+    shutil.copy(src='logs.log', dst=os.path.join(config.OUTPUT_PATH, f'logs_{datetime.now().strftime("%d_%m_%Y-%H_%M_%S")}.log'))

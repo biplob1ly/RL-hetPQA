@@ -32,7 +32,7 @@ _C = CfgNode()
 # cfg = _C
 _C.DESCRIPTION = 'Default config from the Singleton'
 _C.VERSION = 0
-_C.OUTPUT_PATH = '../output/'
+_C.OUTPUT_PATH = './output/'
 _C.EXP = 'default'
 _C.SEED = 42
 _C.DEVICE = None
@@ -54,10 +54,10 @@ _C.DPR.DO_TEST = True
 # -----------------------------------------------------------------------------
 _C.DPR.DATA = CfgNode()
 _C.DPR.DATA.NAME = 'hetPQA'
-_C.DPR.DATA.DATA_PATH = '../data/'
-_C.DPR.DATA.TRAIN_DATA_PATH = '../data/train.json'
-_C.DPR.DATA.VAL_DATA_PATH = '../data/dev.json'
-_C.DPR.DATA.TEST_DATA_PATH = '../data/test.json'
+_C.DPR.DATA.DATA_PATH = './data/'
+_C.DPR.DATA.TRAIN_DATA_PATH = './data/train.json'
+_C.DPR.DATA.VAL_DATA_PATH = './data/dev.json'
+_C.DPR.DATA.TEST_DATA_PATH = './data/test.json'
 _C.DPR.DATA.HARD_NEGATIVES = 1
 _C.DPR.DATA.OTHER_NEGATIVES = 5
 _C.DPR.DATA.NORMALIZE = True
@@ -67,6 +67,7 @@ _C.DPR.DATA.FLATTEN_ATTRIBUTE = True
 # DPR_MODEL
 # -----------------------------------------------------------------------------
 _C.DPR.MODEL = CfgNode()
+_C.DPR.MODEL.MODEL_PATH = None
 # config name for DPR.MODEL initialization
 _C.DPR.MODEL.PRETRAINED_MODEL_CFG = 'bert-base-uncased'
 # DPR.MODEL type. One of [hf_bert, pytext_bert, fairseq_roberta]
