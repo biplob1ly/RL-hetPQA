@@ -46,25 +46,25 @@ def save_eval_metrics(metrics_dt, eval_metrics_path):
         df.to_csv(fout, index=False)
 
 
-def compute_metrics(result_list, metrics):
-    sources = ['all', "attribute", "bullet", "OSP", "Desc", "review", "CQA"]
-    qrels_dt = {source: {} for source in sources}
-    run_dt = {source: {} for source in sources}
+def compute_metrics(result_list, metrics, comp_separate=False):
+    qrels_dt = collections.defaultdict(dict)
+    run_dt = collections.defaultdict(dict)
     count = 0
     for q_dt in result_list:
         ctx_act_score = {str(ctx_id): 1 for ctx_id in q_dt['actual_ctx_ids']}
         ctx_pred_score = {str(ctx_id): score for ctx_id, score in zip(q_dt['pred_ctx_ids'], q_dt['scores'])}
 
         unq_qid = q_dt['qid'] + '_' + str(count)
-        qrels_dt[q_dt['source']][unq_qid] = ctx_act_score
-        run_dt[q_dt['source']][unq_qid] = ctx_pred_score
+        if comp_separate:
+            qrels_dt[q_dt['source']][unq_qid] = ctx_act_score
+            run_dt[q_dt['source']][unq_qid] = ctx_pred_score
 
         qrels_dt['all'][unq_qid] = ctx_act_score
         run_dt['all'][unq_qid] = ctx_pred_score
         count += 1
 
     score_dict = {}
-    for source in sources:
+    for source in qrels_dt:
         qrels = Qrels(qrels_dt[source])
         run = Run(run_dt[source])
         score_dict[source] = evaluate(qrels, run, metrics)

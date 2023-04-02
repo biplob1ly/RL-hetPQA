@@ -438,7 +438,7 @@ class RetrieverTrainer:
                     self.best_cp_name = cp_path
                     logger.info('New Best validation checkpoint %s', cp_path)
             else:
-                sorted_runs = sorted(self.runs, key=lambda x: x.scores)
+                sorted_runs = sorted(self.runs, key=lambda x: x.scores, reverse=True)
                 for dpr_run in sorted_runs[cfg.DPR.SOLVER.CP_SAVE_LIMIT:]:
                     if dpr_run.val_id in self.saved_cps:
                         os.remove(self.saved_cps[dpr_run.val_id])
@@ -448,6 +448,7 @@ class RetrieverTrainer:
                         if best_run.val_id == cur_val_id:
                             self.best_cp_name = cp_path
                             logger.info('New Best validation checkpoint %s', cp_path)
+                        break
 
     def _train_epoch(
         self,
@@ -652,7 +653,7 @@ def run(cfg):
         eval_metrics = ["map", "r-precision", "mrr", "ndcg", "hit_rate@5", "precision@1",
                         "hits@5", "precision@3", "precision@5", "map@1", "map@3",
                         "map@5", "recall@1", "recall@3", "recall@5", "f1@1", "f1@3", "f1@5"]
-        metrics_dt = compute_metrics(result_list, eval_metrics)
+        metrics_dt = compute_metrics(result_list, eval_metrics, comp_separate=True)
         eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics')
         save_eval_metrics(metrics_dt, eval_metrics_path)
         logger.info('Evaluation done. Score per metric saved in %s', eval_metrics_path)
