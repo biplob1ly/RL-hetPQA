@@ -6,6 +6,7 @@ from torch import FloatTensor as FT
 from torch import nn
 from transformers.models.bert.modeling_bert import BertModel, BertConfig
 from transformers import BertTokenizer
+# Use the PyTorch implementation torch.optim.AdamW instead
 from transformers.optimization import AdamW
 
 from dpr.utils.data_utils import Tensorizer

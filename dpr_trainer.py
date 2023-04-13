@@ -209,7 +209,7 @@ class RetrieverTrainer:
             batch_input = BiEncoder.create_biencoder_input(
                 samples=samples_batch,
                 tensorizer=self.tensorizer,
-                insert_title=True,
+                insert_title=cfg.DPR.DATA.INSERT_SOURCE,
                 num_hard_negatives=num_hard_negatives,
                 num_other_negatives=num_other_negatives,
                 shuffle=False
@@ -307,7 +307,7 @@ class RetrieverTrainer:
             ctx_ids, positive_ctx_ids, ctx_id_to_source, single_input = BiEncoder.create_biencoder_single(
                 sample=samples_batch[0],
                 tensorizer=self.tensorizer,
-                insert_title=True
+                insert_title=cfg.DPR.DATA.INSERT_SOURCE
             )
             single_input = BiEncoderSingle(**move_to_device(single_input._asdict(), cfg.DEVICE))
             ctxs_ids = single_input.context_ids
@@ -383,7 +383,7 @@ class RetrieverTrainer:
             batch_input = BiEncoder.create_biencoder_input(
                 samples=samples_batch,
                 tensorizer=self.tensorizer,
-                insert_title=True,
+                insert_title=cfg.DPR.DATA.INSERT_SOURCE,
                 num_hard_negatives=num_hard_negatives,
                 num_other_negatives=num_other_negatives,
                 shuffle=False
@@ -503,7 +503,7 @@ class RetrieverTrainer:
             batch_input = BiEncoder.create_biencoder_input(
                 samples=samples_batch,
                 tensorizer=self.tensorizer,
-                insert_title=True,
+                insert_title=cfg.DPR.DATA.INSERT_SOURCE,
                 num_hard_negatives=num_hard_negatives,
                 num_other_negatives=num_other_negatives,
                 shuffle=True,
