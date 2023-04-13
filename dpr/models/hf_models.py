@@ -28,6 +28,26 @@ class HFBertEncoder(BertModel):
             cfg.hidden_dropout_prob = dropout
         return cls.from_pretrained(cfg_name, config=cfg, project_dim=projection_dim, **kwargs)
 
+    def pool(self, outputs, attention_mask, batch_size, item_count):
+        if self.model_args.pooler_type == 'cls_without_pool':
+            pooled_output = outputs.last_hidden_state[:, 0]
+        elif self.model_args.pooler_type == 'avg':
+            # last_hidden_state: [B x Item_count, S, H]
+            pooled_output = (outputs.last_hidden_state * attention_mask.unsqueeze(-1).sum(1)) / attention_mask.sum(-1).unsqueeze(-1)
+        elif self.model_args.pooler_type == 'avg_first_last':
+            first_last = (outputs.last_hidden_state[0] + outputs.last_hidden_state[-1]) / 2.0
+            pooled_output = (first_last * attention_mask.unsqueeze(-1).sum(1)) / attention_mask.sum(-1).unsqueeze(-1)
+        elif self.model_args.pooler_type == 'avg_top2':
+            top2 = (outputs.last_hidden_state[-1] + outputs.last_hidden_state[-2]) / 2.0
+            pooled_output = (top2 * attention_mask.unsqueeze(-1).sum(1)) / attention_mask.sum(-1).unsqueeze(-1)
+        else:
+            pooled_output = outputs.last_hidden_state[:, 0]
+
+        pooled_output = pooled_output.view((batch_size, item_count, pooled_output.size(-1)))
+        if self.model_args.pooler_type == 'cls':
+            pooled_output = self.activation(self.fc(pooled_output))
+        return pooled_output
+
     def forward(self, input_ids: T, token_type_ids: T, attention_mask: T) -> Tuple[FT, ...]:
         # https://huggingface.co/docs/transformers/model_doc/bert#transformers.BertModel.forward
         model_out = super().forward(input_ids=input_ids,

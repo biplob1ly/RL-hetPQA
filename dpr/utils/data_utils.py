@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 from torch import Tensor as T
 
 logger = logging.getLogger()
-BiEncoderPassage = collections.namedtuple("BiEncoderPassage", ["cid", "text", "title"])
+BiEncoderPassage = collections.namedtuple("BiEncoderPassage", ["cid", "text", "title", "source"])
 
 
 class Tensorizer(object):
@@ -107,7 +107,6 @@ def read_data_from_json_files(paths: List[str]) -> List:
 class BiEncoderSample:
     qid: str
     query: str
-    source: str
     positive_passages: List[BiEncoderPassage]
     negative_passages: List[BiEncoderPassage]
     hard_negative_passages: List[BiEncoderPassage]
@@ -157,8 +156,7 @@ class JsonQADataset(QADataset):
         normalize: bool = False,
         flatten_attr: bool = False,
         query_special_suffix: str = None,
-        # tmp: for cc-net results only
-        exclude_gold: bool = False,
+        exclude_gold: bool = False
     ):
         super().__init__(
             special_token=special_token,
@@ -200,7 +198,6 @@ class JsonQADataset(QADataset):
         r.query = self._process_query(json_sample["question"])
 
         positive_ctxs = json_sample["positive_ctxs"]
-        r.source = positive_ctxs[0].get("source", None)
         negative_ctxs = json_sample["negative_ctxs"] if "negative_ctxs" in json_sample else []
         hard_negative_ctxs = json_sample["hard_negative_ctxs"] if "hard_negative_ctxs" in json_sample else []
 
@@ -211,7 +208,8 @@ class JsonQADataset(QADataset):
             return BiEncoderPassage(
                 ctx.get("cid", None),
                 ctx["text"],
-                ctx.get("title", None)
+                ctx.get("title", None),
+                ctx.get("source", None)
             )
 
         r.positive_passages = [create_passage(ctx) for ctx in positive_ctxs]

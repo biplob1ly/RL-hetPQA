@@ -41,7 +41,7 @@ from dpr.utils.model_utils import (
 from dpr.options import set_encoder_params_from_state, get_encoder_params_state, setup_cfg_gpu, set_seed
 from dpr.utils.data_utils import JsonQADataset, SharedDataIterator
 from dpr.indexer.faiss_indexers import DenseFlatIndexer
-from utils import save_ranking_results, save_eval_metrics, compute_metrics, DPRTrainerRun, format_dpr_run
+from utils import save_ranking_results, save_combined_results, save_eval_metrics, compute_metrics, DPRTrainerRun, format_dpr_run
 
 logging.basicConfig(
     filename='logs.log',
@@ -133,6 +133,7 @@ class RetrieverTrainer:
             global_q_vectors,
             global_ctxs_vector,
             positive_idx_per_question,
+            cfg.DPR.SOLVER.TEMPERATURE,
             hard_negatives_per_question
         )
         return loss, correct_predictions_count
@@ -163,7 +164,7 @@ class RetrieverTrainer:
 
         if self.cfg.N_GPU > 1:
             loss = loss.mean()
-        if self.cfg.DPR.SOLVER.GRADIENT_ACCUMULATION_STEPS > 1:
+        if self.biencoder.training and self.cfg.DPR.SOLVER.GRADIENT_ACCUMULATION_STEPS > 1:
             loss = loss / self.cfg.DPR.SOLVER.GRADIENT_ACCUMULATION_STEPS
 
         return loss, total_correct_preds
@@ -298,38 +299,57 @@ class RetrieverTrainer:
         )
         start_time = time.time()
         log_result_step = cfg.DPR.SOLVER.LOG_TEST_STEP
+        sub_batch_size = cfg.DPR.SOLVER.TEST_CTX_BSZ
+        embed_size = self.biencoder.ctx_model.get_out_size()
         result_list = []
         for i, samples_batch in enumerate(test_iterator.iterate_data()):
             # Do not shuffle test positives/negatives
-            all_ctx_ids, positive_ctx_ids, single_input = BiEncoder.create_biencoder_single(
+            ctx_ids, positive_ctx_ids, ctx_id_to_source, single_input = BiEncoder.create_biencoder_single(
                 sample=samples_batch[0],
                 tensorizer=self.tensorizer,
                 insert_title=True
             )
             single_input = BiEncoderSingle(**move_to_device(single_input._asdict(), cfg.DEVICE))
-            q_attn_mask = self.tensorizer.get_attn_mask(single_input.question_ids)
-            ctx_attn_mask = self.tensorizer.get_attn_mask(single_input.context_ids)
-            with torch.no_grad():
-                q_embeds, ctx_embeds = self.biencoder(
-                    single_input.question_ids,
-                    single_input.question_segments,
-                    q_attn_mask,
-                    single_input.context_ids,
-                    single_input.ctx_segments,
-                    ctx_attn_mask
+            ctxs_ids = single_input.context_ids
+            ctxs_segments = single_input.ctx_segments
+            bsz = ctxs_ids.size(0)
+            q_embeds = []
+            ctx_embeds = []
+            for j, batch_start in enumerate(range(0, bsz, sub_batch_size)):
+                q_ids, q_segments = (
+                    (single_input.question_ids, single_input.question_segments) if j == 0 else (None, None)
                 )
-            indexer = DenseFlatIndexer(self.biencoder.ctx_model.get_out_size())
-            q_embeds = q_embeds.cpu().numpy()
-            ctx_embeds = ctx_embeds.cpu().numpy()
-            assert len(ctx_embeds) == len(all_ctx_ids)
-            indexer.index_data(ctx_embeds, np.array(all_ctx_ids))
-            ctx_scores_arr, ctx_ids_arr = indexer.search_knn(q_embeds, len(all_ctx_ids))
+                ctx_ids_batch = ctxs_ids[batch_start:batch_start + sub_batch_size]
+                ctx_seg_batch = ctxs_segments[batch_start:batch_start + sub_batch_size]
+
+                q_attn_mask = self.tensorizer.get_attn_mask(q_ids) if j == 0 else None
+                ctx_attn_mask = self.tensorizer.get_attn_mask(ctx_ids_batch)
+                with torch.no_grad():
+                    q_dense, ctx_dense = self.biencoder(
+                        q_ids,
+                        q_segments,
+                        q_attn_mask,
+                        ctx_ids_batch,
+                        ctx_seg_batch,
+                        ctx_attn_mask
+                    )
+                if q_dense is not None:
+                    q_embeds.extend(q_dense.cpu().split(1, dim=0))
+                ctx_embeds.extend(ctx_dense.cpu().split(1, dim=0))
+            indexer = DenseFlatIndexer(embed_size)
+            q_embeds = torch.cat(q_embeds, dim=0).numpy()
+            ctx_embeds = torch.cat(ctx_embeds, dim=0).numpy()
+            assert len(ctx_embeds) == len(ctx_ids)
+            indexer.index_data(ctx_embeds, np.array([int(ctx_id) for ctx_id in ctx_ids]))
+            ctx_scores_arr, ctx_ids_arr = indexer.search_knn(q_embeds, len(ctx_ids))
+            pred_ctx_ids = [str(ctx_id) for ctx_id in ctx_ids_arr[0].tolist()]
+            pred_ctx_sources = [ctx_id_to_source[ctx_id] for ctx_id in pred_ctx_ids]
             result_list.append(
                 {
                     'qid': samples_batch[0].qid,
-                    'source': samples_batch[0].source,
+                    'pred_ctx_sources': pred_ctx_sources,
                     'scores': ctx_scores_arr[0].tolist(),
-                    'pred_ctx_ids': ctx_ids_arr[0].tolist(),
+                    'pred_ctx_ids': pred_ctx_ids,
                     'actual_ctx_ids': positive_ctx_ids
                 }
             )
@@ -374,7 +394,7 @@ class RetrieverTrainer:
             total_correct_predictions += correct_cnt
             batches += 1
             if (i + 1) % log_result_step == 0:
-                logger.info('Eval step: %d , used_time=%f sec., loss=%f ', i+1, time.time() - start_time, loss.item())
+                logger.info('Eval iteration: %d , used_time=%f sec., loss=%f ', i+1, time.time() - start_time, loss.item())
 
         total_loss = total_loss / batches
         total_samples = batches * cfg.DPR.SOLVER.VAL_BATCH_SIZE * self.distributed_factor
@@ -471,7 +491,6 @@ class RetrieverTrainer:
         epoch_batches = train_data_iterator.max_iterations
         data_iteration = 0
         step_count = 0
-        last_saved_iteration = -1
 
         # TODO: Check this
         # biencoder = get_model_obj(self.biencoder)
@@ -513,43 +532,40 @@ class RetrieverTrainer:
                 self.biencoder.zero_grad()
                 step_count += 1
 
-            if step_count % log_result_step == 0:
-                lr = self.optimizer.param_groups[0]["lr"]
-                logger.info(
-                    "Epoch: %d: iteration: %d/%d, loss=%f, lr=%f",
-                    epoch,
-                    data_iteration,
-                    epoch_batches,
-                    loss.item(),
-                    lr,
-                )
+                if step_count % log_result_step == 0:
+                    lr = self.optimizer.param_groups[0]["lr"]
+                    logger.info(
+                        "Epoch: %d: iteration: %d/%d, loss=%f, lr=%f",
+                        epoch,
+                        data_iteration,
+                        epoch_batches,
+                        loss.item(),
+                        lr,
+                    )
 
-            if step_count % rolling_loss_step == 0:
-                logger.info("Train batch %d", data_iteration)
-                latest_rolling_train_av_loss = rolling_train_loss / rolling_loss_step
-                logger.info(
-                    "Avg. loss per last %d batches: %f",
-                    rolling_loss_step,
-                    latest_rolling_train_av_loss,
-                )
-                rolling_train_loss = 0.0
+                if step_count % rolling_loss_step == 0:
+                    logger.info("Train batch %d", data_iteration)
+                    latest_rolling_train_av_loss = rolling_train_loss / rolling_loss_step
+                    logger.info(
+                        "Avg. loss per last %d steps: %f",
+                        rolling_loss_step,
+                        latest_rolling_train_av_loss,
+                    )
+                    rolling_train_loss = 0.0
 
-            # if step_count % eval_step == 0:
-            #     logger.info(
-            #         "rank=%d, Validation: Epoch: %d iteration: %d/%d",
-            #         cfg.LOCAL_RANK,
-            #         epoch,
-            #         data_iteration,
-            #         epoch_batches,
-            #     )
-            #     self.validate_and_save(epoch, data_iteration, scheduler)
-            #     last_saved_iteration = data_iteration
-            #     self.biencoder.train()
+                # if step_count % eval_step == 0:
+                #     logger.info(
+                #         "rank=%d, Validation: Epoch: %d iteration: %d/%d",
+                #         cfg.LOCAL_RANK,
+                #         epoch,
+                #         data_iteration,
+                #         epoch_batches,
+                #     )
+                #     self.validate_and_save(epoch, data_iteration, scheduler)
+                #     self.biencoder.train()
 
         logger.info("Epoch finished on rank %d", cfg.LOCAL_RANK)
-        if last_saved_iteration != data_iteration:
-            self.validate_and_save(epoch, data_iteration, scheduler)
-
+        self.validate_and_save(epoch, data_iteration, scheduler)
         epoch_loss = (epoch_loss / epoch_batches) if epoch_batches > 0 else 0
         logger.info("Av Loss per epoch=%f", epoch_loss)
         logger.info("epoch total correct predictions=%d", epoch_correct_predictions)
@@ -627,6 +643,8 @@ def run(cfg):
     set_seed(cfg.SEED)
 
     if cfg.DPR.DO_TRAIN:
+        config.DPR.DATA.TRAIN_DATA_PATH = os.path.join(data_path, 'separated', 'train.json')
+        config.DPR.DATA.VAL_DATA_PATH = os.path.join(data_path, 'mixed', 'dev.json')
         model_file = get_model_file(cfg, cfg.DPR.MODEL.CHECKPOINT_FILE_NAME)
         retriever_trainer = RetrieverTrainer(cfg, model_file=model_file)
         train_dataset = JsonQADataset(cfg.DPR.DATA.TRAIN_DATA_PATH,
@@ -641,15 +659,19 @@ def run(cfg):
         cfg.DPR.MODEL.CHECKPOINT_FILE_NAME = os.path.basename(best_cp_path)
 
     if cfg.DPR.DO_TEST:
+        config.DPR.DATA.TEST_DATA_PATH = os.path.join(data_path, 'mixed', 'test.json')
         model_file = get_model_file(cfg, cfg.DPR.MODEL.CHECKPOINT_FILE_NAME)
         retriever_trainer = RetrieverTrainer(cfg, model_file=model_file)
         test_dataset = JsonQADataset(cfg.DPR.DATA.TEST_DATA_PATH,
                                      normalize=cfg.DPR.DATA.NORMALIZE,
                                      flatten_attr=cfg.DPR.DATA.FLATTEN_ATTRIBUTE)
         result_list = retriever_trainer.evaluate(test_dataset)
-        ranking_result_path = os.path.join(cfg.OUTPUT_PATH, f'rank_score_ids.jsonl')
+        ranking_result_path = os.path.join(cfg.OUTPUT_PATH, 'rank_score_ids.jsonl')
         save_ranking_results(result_list, ranking_result_path)
         logger.info('Rank and score saved in %s', ranking_result_path)
+        combined_result_path = os.path.join(cfg.OUTPUT_PATH, 'combined_score_ids.json')
+        save_combined_results(result_list, config.DPR.DATA.TEST_DATA_PATH, combined_result_path)
+        logger.info('Combined score saved in %s', combined_result_path)
         eval_metrics = ["map", "r-precision", "mrr", "ndcg", "hit_rate@5", "precision@1",
                         "hits@5", "precision@3", "precision@5", "map@1", "map@3",
                         "map@5", "recall@1", "recall@3", "recall@5", "f1@1", "f1@3", "f1@5"]
@@ -674,9 +696,6 @@ if __name__ == "__main__":
         config.merge_from_file(exp_cfg_path)
     if data_path is not None:
         config.DPR.DATA.DATA_PATH = data_path
-        config.DPR.DATA.TRAIN_DATA_PATH = os.path.join(data_path, 'train.json')
-        config.DPR.DATA.VAL_DATA_PATH = os.path.join(data_path, 'dev.json')
-        config.DPR.DATA.TEST_DATA_PATH = os.path.join(data_path, 'test.json')
     if output_path is not None:
         config.OUTPUT_PATH = output_path
     if dpr_ckpt is not None:

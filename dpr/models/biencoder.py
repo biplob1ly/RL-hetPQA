@@ -56,6 +56,7 @@ class BiEncoderNllLoss:
         q_vectors: T,
         ctx_vectors: T,
         positive_idx_per_question: list,
+        temperature: float,
         hard_negatice_idx_per_question: list = None
     ) -> Tuple[T, int]:
         """
@@ -64,7 +65,7 @@ class BiEncoderNllLoss:
         loss modifications. For example - weighted NLL with different factors for hard vs regular negatives.
         :return: a tuple of loss value and amount of correct predictions per batch
         """
-        scores = self.get_scores(q_vectors, ctx_vectors)
+        scores = self.get_scores(q_vectors, ctx_vectors) / temperature
 
         if len(q_vectors.size()) > 1:
             q_num = q_vectors.size(0)
@@ -153,8 +154,10 @@ class BiEncoder(nn.Module):
         hard_neg_ctxs = sample.hard_negative_passages
         all_ctxs = positive_ctxs + neg_ctxs + hard_neg_ctxs
         all_ctx_ids, all_ctx_tensors = [], []
+        ctx_id_to_source = {}
         for ctx in all_ctxs:
             all_ctx_ids.append(ctx.cid)
+            ctx_id_to_source[ctx.cid] = ctx.source
             all_ctx_tensors.append(
                 tensorizer.text_to_tensor(
                     text=ctx.text,
@@ -167,7 +170,7 @@ class BiEncoder(nn.Module):
         ctx_segments = torch.zeros_like(ctxs_tensor)
         question_segments = torch.zeros_like(questions_tensor)
 
-        return all_ctx_ids, positive_ctx_ids, BiEncoderSingle(
+        return all_ctx_ids, positive_ctx_ids, ctx_id_to_source, BiEncoderSingle(
             questions_tensor,
             question_segments,
             ctxs_tensor,
