@@ -32,7 +32,7 @@ from typing import Tuple, Dict
 from configs.config import get_cfg_defaults
 
 from dpr.models.hf_models import get_bert_biencoder_components
-from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch, BiEncoderSingle
+from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch, BiEncoderSingle,BiEncoderOutput
 from dpr.utils.model_utils import (
     load_states_from_checkpoint, get_model_obj,
     setup_for_distributed_mode, CheckpointState,
@@ -41,7 +41,10 @@ from dpr.utils.model_utils import (
 from dpr.options import set_encoder_params_from_state, get_encoder_params_state, setup_cfg_gpu, set_seed
 from dpr.utils.data_utils import JsonQADataset, SharedDataIterator
 from dpr.indexer.faiss_indexers import DenseFlatIndexer
-from utils import save_ranking_results, save_combined_results, save_eval_metrics, compute_metrics, DPRTrainerRun, format_dpr_run
+from utils import (
+    save_ranking_results, save_combined_results, save_eval_metrics, compute_metrics,
+    DPRTrainerRun, format_dpr_run, get_ranked_ctxs
+)
 
 logging.basicConfig(
     filename='logs.log',
@@ -79,9 +82,9 @@ class RetrieverTrainer:
         self.runs = []
         self.saved_cps = {}
         self.best_cp_name = None
-        self.loss_function = BiEncoderNllLoss()
+        self.loss_function = BiEncoderNllLoss(cfg.DPR.SOLVER.COMPARISON_TYPE, cfg.DPR.SOLVER.COMPARISON_FUNCTION)
         if saved_state:
-            strict = True if cfg.DPR.MODEL.PROJECTION_DIM == 0 else False
+            strict = not (cfg.DPR.MODEL.POOLING_PROJECTION_DIM or cfg.DPR.MODEL.SEQUENCE_PROJECTION_DIM)
             self._load_saved_state(saved_state, strict=strict)
         self.train_dataset = None
         self.val_dataset = None
@@ -110,8 +113,7 @@ class RetrieverTrainer:
 
     def _calc_loss(
             self,
-            local_q_vectors,
-            local_ctx_vectors,
+            model_out,
             local_positive_idxs,
             local_hard_negatives_idxs: list = None,
     ) -> Tuple[T, int]:
@@ -124,14 +126,12 @@ class RetrieverTrainer:
         if distributed_world_size > 1:
             raise NotImplementedError
         else:
-            global_q_vectors = local_q_vectors
-            global_ctxs_vector = local_ctx_vectors
+            global_model_out = model_out
             positive_idx_per_question = local_positive_idxs
             hard_negatives_per_question = local_hard_negatives_idxs
 
         loss, correct_predictions_count = self.loss_function.calc(
-            global_q_vectors,
-            global_ctxs_vector,
+            global_model_out,
             positive_idx_per_question,
             cfg.DPR.SOLVER.TEMPERATURE,
             hard_negatives_per_question
@@ -148,15 +148,14 @@ class RetrieverTrainer:
         ctx_attn_mask = self.tensorizer.get_attn_mask(batch_input.context_ids)
 
         if self.biencoder.training:
-            model_out = self.biencoder(batch_input.question_ids, batch_input.question_segments, q_attn_mask,
+            model_output = self.biencoder(batch_input.question_ids, batch_input.question_segments, q_attn_mask,
                                        batch_input.context_ids, batch_input.ctx_segments, ctx_attn_mask)
         else:
             with torch.no_grad():
-                model_out = self.biencoder(batch_input.question_ids, batch_input.question_segments, q_attn_mask,
+                model_output = self.biencoder(batch_input.question_ids, batch_input.question_segments, q_attn_mask,
                                            batch_input.context_ids, batch_input.ctx_segments, ctx_attn_mask)
 
-        local_q_vectors, local_ctx_vectors = model_out
-        loss, correct_predictions_count = self._calc_loss(local_q_vectors, local_ctx_vectors,
+        loss, correct_predictions_count = self._calc_loss(model_output,
                                                           batch_input.positive_ctx_indices,
                                                           batch_input.hard_neg_ctx_indices)
 
@@ -193,7 +192,7 @@ class RetrieverTrainer:
         data_iterator = self.dev_iterator
 
         sub_batch_size = cfg.DPR.SOLVER.VAL_AV_RANK_BSZ
-        sim_score_f = BiEncoderNllLoss.get_similarity_function()
+        sim_score_f = self.loss_function.get_comparison_function()
         q_represenations = []
         ctx_represenations = []
         positive_idx_per_question = []
@@ -238,7 +237,7 @@ class RetrieverTrainer:
                 q_attn_mask = self.tensorizer.get_attn_mask(q_ids)
                 ctx_attn_mask = self.tensorizer.get_attn_mask(ctx_ids_batch)
                 with torch.no_grad():
-                    q_dense, ctx_dense = self.biencoder(
+                    model_output = self.biencoder(
                         q_ids,
                         q_segments,
                         q_attn_mask,
@@ -246,6 +245,7 @@ class RetrieverTrainer:
                         ctx_seg_batch,
                         ctx_attn_mask
                     )
+                    q_dense, ctx_dense = model_output.q_pooled, model_output.ctx_pooled
 
                 if q_dense is not None:
                     q_represenations.extend(q_dense.cpu().split(1, dim=0))
@@ -300,7 +300,8 @@ class RetrieverTrainer:
         start_time = time.time()
         log_result_step = cfg.DPR.SOLVER.LOG_TEST_STEP
         sub_batch_size = cfg.DPR.SOLVER.TEST_CTX_BSZ
-        embed_size = self.biencoder.ctx_model.get_out_size()
+        # embed_size = self.biencoder.ctx_model.get_out_size()
+        scoring_func = self.loss_function.get_comparison_function()
         result_list = []
         for i, samples_batch in enumerate(test_iterator.iterate_data()):
             # Do not shuffle test positives/negatives
@@ -313,8 +314,8 @@ class RetrieverTrainer:
             ctxs_ids = single_input.context_ids
             ctxs_segments = single_input.ctx_segments
             bsz = ctxs_ids.size(0)
-            q_embeds = []
-            ctx_embeds = []
+            q_embeds = None
+            scores = []
             for j, batch_start in enumerate(range(0, bsz, sub_batch_size)):
                 q_ids, q_segments = (
                     (single_input.question_ids, single_input.question_segments) if j == 0 else (None, None)
@@ -325,7 +326,7 @@ class RetrieverTrainer:
                 q_attn_mask = self.tensorizer.get_attn_mask(q_ids) if j == 0 else None
                 ctx_attn_mask = self.tensorizer.get_attn_mask(ctx_ids_batch)
                 with torch.no_grad():
-                    q_dense, ctx_dense = self.biencoder(
+                    model_output = self.biencoder(
                         q_ids,
                         q_segments,
                         q_attn_mask,
@@ -333,22 +334,37 @@ class RetrieverTrainer:
                         ctx_seg_batch,
                         ctx_attn_mask
                     )
+                    if cfg.DPR.SOLVER.COMPARISON_TYPE == "representaton_matching":
+                        q_dense = model_output.q_pooled
+                        ctx_embeds = model_output.ctx_pooled
+                    elif cfg.DPR.SOLVER.COMPARISON_TYPE == "cross_interaction":
+                        q_dense = model_output.q_seq
+                        ctx_embeds = model_output.ctx_seq
+                    else:
+                        raise ValueError
                 if q_dense is not None:
-                    q_embeds.extend(q_dense.cpu().split(1, dim=0))
-                ctx_embeds.extend(ctx_dense.cpu().split(1, dim=0))
-            indexer = DenseFlatIndexer(embed_size)
-            q_embeds = torch.cat(q_embeds, dim=0).numpy()
-            ctx_embeds = torch.cat(ctx_embeds, dim=0).numpy()
-            assert len(ctx_embeds) == len(ctx_ids)
-            indexer.index_data(ctx_embeds, np.array([int(ctx_id) for ctx_id in ctx_ids]))
-            ctx_scores_arr, ctx_ids_arr = indexer.search_knn(q_embeds, len(ctx_ids))
-            pred_ctx_ids = [str(ctx_id) for ctx_id in ctx_ids_arr[0].tolist()]
+                    q_embeds = q_dense
+                scores.extend(scoring_func(q_embeds, ctx_embeds).cpu().flatten().tolist())
+                # if q_dense is not None:
+                #     q_embeds.extend(q_dense.cpu().split(1, dim=0))
+                # ctx_embeds.extend(ctx_dense.cpu().split(1, dim=0))
+            # q_embeds = torch.cat(q_embeds, dim=0)
+            # ctx_embeds = torch.cat(ctx_embeds, dim=0)
+            # assert len(ctx_embeds) == len(ctx_ids)
+
+            # indexer = DenseFlatIndexer(embed_size)
+            # indexer.index_data(ctx_embeds.numpy(), np.array([int(ctx_id) for ctx_id in ctx_ids]))
+            # ctx_scores_arr, ctx_ids_arr = indexer.search_knn(q_embeds.numpy(), len(ctx_ids))
+            # ctx_scores_list, ctx_ids_list = ctx_scores_arr[0].tolist(), ctx_ids_arr[0].tolist()
+            # pred_ctx_ids = [str(ctx_id) for ctx_id in ctx_ids_list]
+            ctx_scores_list, pred_ctx_ids = get_ranked_ctxs(scores, ctx_ids)
+
             pred_ctx_sources = [ctx_id_to_source[ctx_id] for ctx_id in pred_ctx_ids]
             result_list.append(
                 {
                     'qid': samples_batch[0].qid,
                     'pred_ctx_sources': pred_ctx_sources,
-                    'scores': ctx_scores_arr[0].tolist(),
+                    'scores': ctx_scores_list,
                     'pred_ctx_ids': pred_ctx_ids,
                     'actual_ctx_ids': positive_ctx_ids
                 }

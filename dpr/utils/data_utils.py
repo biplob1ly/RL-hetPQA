@@ -43,6 +43,9 @@ class Tensorizer(object):
     def set_pad_to_max(self, pad: bool):
         raise NotImplementedError
 
+    def get_skip_list(self, tokens):
+        raise NotImplementedError
+
 
 def normalize_question(question: str) -> str:
     question = question.replace("’", "'")

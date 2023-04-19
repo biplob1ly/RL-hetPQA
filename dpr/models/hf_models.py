@@ -1,5 +1,6 @@
 from typing import Tuple
 
+import string
 import torch
 from torch import Tensor as T
 from torch import FloatTensor as FT
@@ -7,7 +8,7 @@ from torch import nn
 from transformers.models.bert.modeling_bert import BertModel, BertConfig
 from transformers import BertTokenizer
 # Use the PyTorch implementation torch.optim.AdamW instead
-from transformers.optimization import AdamW
+from torch.optim import AdamW
 
 from dpr.utils.data_utils import Tensorizer
 from .biencoder import BiEncoder
@@ -15,19 +16,28 @@ from .biencoder import BiEncoder
 
 class HFBertEncoder(BertModel):
 
-    def __init__(self, config, project_dim: int = 0):
+    def __init__(self, config, dpr_config, skip_list, pad_token):
         BertModel.__init__(self, config)
         assert config.hidden_size > 0, 'Encoder hidden_size can\'t be zero'
-        self.encode_proj = nn.Linear(config.hidden_size, project_dim) if project_dim != 0 else None
+
+        self.skip_list = skip_list
+        self.pad_token = pad_token
+        self.pooling_layer = nn.Linear(config.hidden_size, dpr_config.POOLING_PROJECTION_DIM) if dpr_config.POOLING_PROJECTION_DIM != 0 else None
+        self.sequence_layer = nn.Linear(config.hidden_size, dpr_config.SEQUENCE_PROJECTION_DIM) if dpr_config.SEQUENCE_PROJECTION_DIM != 0 else None
         self.init_weights()
 
     @classmethod
-    def init_encoder(cls, cfg_name: str, projection_dim: int = 0, dropout: float = 0.1, **kwargs) -> BertModel:
-        cfg = BertConfig.from_pretrained(cfg_name if cfg_name else 'bert-base-uncased')
-        if dropout != 0:
-            cfg.attention_probs_dropout_prob = dropout
-            cfg.hidden_dropout_prob = dropout
-        return cls.from_pretrained(cfg_name, config=cfg, project_dim=projection_dim, **kwargs)
+    def init_encoder(cls, dpr_config, skip_list, pad_token, **kwargs) -> BertModel:
+        bert_config = BertConfig.from_pretrained(dpr_config.PRETRAINED_MODEL_CFG if dpr_config.PRETRAINED_MODEL_CFG else 'bert-base-uncased')
+        if dpr_config.DROPOUT != 0:
+            bert_config.attention_probs_dropout_prob = dpr_config.DROPOUT
+            bert_config.hidden_dropout_prob = dpr_config.DROPOUT
+        return cls.from_pretrained(
+            dpr_config.PRETRAINED_MODEL_CFG,
+            config=bert_config,
+            dpr_config=dpr_config,
+            skip_list=skip_list,
+            pad_token=pad_token, **kwargs)
 
     def pool(self, outputs, attention_mask, batch_size, item_count):
         if self.model_args.pooler_type == 'cls_without_pool':
@@ -57,14 +67,23 @@ class HFBertEncoder(BertModel):
 
         sequence_output, pooled_output, hidden_states = model_out.last_hidden_state, model_out.pooler_output, model_out.hidden_states
         pooled_output = sequence_output[:, 0, :]
-        if self.encode_proj:
-            pooled_output = self.encode_proj(pooled_output)
+        if self.sequence_layer:
+            sequence_output = self.sequence_layer(sequence_output)
+            mask = torch.tensor(self.mask(input_ids), device=sequence_output.device).unsqueeze(2).float()
+            sequence_output = sequence_output * mask
+            # sequence_output = torch.nn.functional.normalize(sequence_output, p=2, dim=2)
+        if self.pooling_layer:
+            pooled_output = self.pooling_layer(pooled_output)
         return sequence_output, pooled_output, hidden_states
 
     def get_out_size(self):
-        if self.encode_proj:
-            return self.encode_proj.out_features
+        if self.pooling_layer:
+            return self.pooling_layer.out_features
         return self.config.hidden_size
+
+    def mask(self, input_ids):
+        mask = [[(x not in self.skip_list) and (x != self.pad_token) for x in d] for d in input_ids.cpu().tolist()]
+        return mask
 
 
 class BertTensorizer(Tensorizer):
@@ -124,6 +143,11 @@ class BertTensorizer(Tensorizer):
     def set_pad_to_max(self, do_pad: bool):
         self.pad_to_max = do_pad
 
+    def get_skip_list(self, tokens):
+        return {w: True
+                for symbol in tokens
+                for w in [symbol, self.tokenizer.encode(symbol, add_special_tokens=False)[0]]}
+
 
 def get_bert_tokenizer(pretrained_cfg_name: str, do_lower_case: bool = True):
     return BertTokenizer.from_pretrained(pretrained_cfg_name, do_lower_case=do_lower_case)
@@ -151,23 +175,21 @@ def get_optimizer(model: nn.Module, learning_rate: float = 1e-5, adam_eps: float
          'weight_decay': weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, eps=adam_eps, correct_bias=False)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, eps=adam_eps)
     return optimizer
 
 
 def get_bert_biencoder_components(cfg, inference_only: bool = False, **kwargs):
-    dropout = cfg.DPR.SOLVER.DROPOUT if hasattr(cfg.DPR.SOLVER, 'DROPOUT') else 0.0
-
     # modify based on cfg so it could load both bert and roberta models
     if 'hf' in cfg.DPR.MODEL.ENCODER_MODEL_TYPE:
+        tensorizer = get_ance_tensorizer(cfg)
+        skip_list = tensorizer.get_skip_list(string.punctuation)
+        pad_token = tensorizer.get_pad_id()
         if cfg.DPR.MODEL.PRETRAINED_MODEL_CFG and 'bert-' in cfg.DPR.MODEL.PRETRAINED_MODEL_CFG:
-            question_encoder = HFBertEncoder.init_encoder(cfg.DPR.MODEL.PRETRAINED_MODEL_CFG,
-                                                          projection_dim=cfg.DPR.MODEL.PROJECTION_DIM, dropout=dropout, **kwargs)
-            ctx_encoder = HFBertEncoder.init_encoder(cfg.DPR.MODEL.PRETRAINED_MODEL_CFG,
-                                                     projection_dim=cfg.DPR.MODEL.PROJECTION_DIM, dropout=dropout, **kwargs)
+            question_encoder = HFBertEncoder.init_encoder(cfg.DPR.MODEL, [], pad_token, **kwargs)
+            ctx_encoder = HFBertEncoder.init_encoder(cfg.DPR.MODEL, skip_list, pad_token, **kwargs)
         else:
             raise NotImplementedError
-        tensorizer = get_ance_tensorizer(cfg)
     else:
         raise NotImplementedError(f'{cfg.DPR.MODEL.ENCODER_MODEL_TYPE} is not implemented yet.')
 

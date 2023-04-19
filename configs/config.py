@@ -76,7 +76,8 @@ _C.DPR.MODEL.ENCODER_MODEL_TYPE = 'hf_bert'
 # Some encoders need to be initialized from a file
 _C.DPR.MODEL.PRETRAINED_FILE = None
 # Extra linear layer on top of standard bert/roberta encoder
-_C.DPR.MODEL.PROJECTION_DIM = 0
+_C.DPR.MODEL.POOLING_PROJECTION_DIM = 0
+_C.DPR.MODEL.SEQUENCE_PROJECTION_DIM = 0
 # Max length of the encoder input sequence
 _C.DPR.MODEL.SEQUENCE_LENGTH = 512
 # Whether to lower case the input text. Set True for uncased DPR.MODELs, False for the cased ones.
@@ -85,6 +86,8 @@ _C.DPR.MODEL.CHECKPOINT_FILE_NAME = 'dpr_biencoder'
 # A trained bi-encoder checkpoint file to initialize the model
 _C.DPR.MODEL.MODEL_FILE = None
 _C.DPR.MODEL.FIX_CTX_ENCODER = False
+_C.DPR.MODEL.DROPOUT = 0.1
+_C.DPR.MODEL.MASK_PUNCT = False
 
 _C.DPR.SOLVER = CfgNode()
 _C.DPR.SOLVER.TRAIN_BATCH_SIZE = 2
@@ -104,7 +107,8 @@ _C.DPR.SOLVER.LOG_TEST_STEP = 1000
 _C.DPR.SOLVER.TEST_CTX_BSZ = 8
 _C.DPR.SOLVER.TRAIN_ROLLING_LOSS_STEP = 2
 
-_C.DPR.SOLVER.DROPOUT = 0.1
+_C.DPR.SOLVER.COMPARISON_TYPE = 'representaton_matching'
+_C.DPR.SOLVER.COMPARISON_FUNCTION = 'dot_product'
 _C.DPR.SOLVER.TEMPERATURE = 0.5
 _C.DPR.SOLVER.GRADIENT_ACCUMULATION_STEPS = 1
 # Linear warmup over warmup_steps.

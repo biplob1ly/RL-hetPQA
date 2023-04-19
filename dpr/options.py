@@ -11,7 +11,8 @@ def get_encoder_checkpoint_params_names():
     return ['PRETRAINED_MODEL_CFG',
             'ENCODER_MODEL_TYPE',
             'PRETRAINED_FILE',
-            'PROJECTION_DIM',
+            'POOLING_PROJECTION_DIM',
+            'SEQUENCE_PROJECTION_DIM',
             'SEQUENCE_LENGTH',
             'DO_LOWER_CASE']
 

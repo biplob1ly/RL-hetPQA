@@ -1,5 +1,8 @@
 import collections
 import json
+
+import torch
+import numpy as np
 import pandas as pd
 from ranx import Qrels, Run, evaluate, compare
 import copy
@@ -90,6 +93,14 @@ def compute_metrics(result_list, metrics, comp_separate=False):
         score_dict[source] = evaluate(qrels, run, metrics)
         score_dict[source]['count'] = len(qrels_dt[source])
     return score_dict
+
+
+def get_ranked_ctxs(scores, ctx_ids):
+    assert len(scores) == len(ctx_ids)
+    sorted_scores, sorted_indices = torch.tensor(scores).sort(descending=True)
+    sorted_scores_list = sorted_scores.tolist()
+    sorted_ctx_ids = [ctx_ids[i] for i in sorted_indices.tolist()]
+    return sorted_scores_list, sorted_ctx_ids
 
 
 def precision_recall_at_k(ranked_items, k):

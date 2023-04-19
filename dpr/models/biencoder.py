@@ -31,32 +31,72 @@ BiEncoderSingle = collections.namedtuple(
     ]
 )
 
+BiEncoderOutput = collections.namedtuple(
+    'BiEncoderOutput',
+    [
+        'q_pooled',
+        'q_seq',
+        'ctx_pooled',
+        'ctx_seq'
+    ]
+)
 
-def dot_product_scores(q_vectors: T, ctx_vectors: T) -> T:
+
+def repr_dot_product_scores(q_vectors: T, ctx_vectors: T) -> T:
     """
     calculates q->ctx scores for every row in ctx_vector
     :param q_vectors:
     :param ctx_vectors:
     :return:
     """
-    # q_vector: n1 x D, ctx_vectors: n2 x D, result n1 x n2
+    # q_vector: q x d, ctx_vectors: c x d, result: q x c
     r = torch.matmul(q_vectors, torch.transpose(ctx_vectors, 0, 1))
     return r
 
 
-def cosine_scores(q_vector: T, ctx_vectors: T):
-    # q_vector: n1 x D, ctx_vectors: n2 x D, result n1 x n2
-    return F.cosine_similarity(q_vector, ctx_vectors, dim=1)
+def repr_cosine_scores(q_vector: T, ctx_vectors: T):
+    # q_vector: q x d -> q x 1 x d, ctx_vectors: c x d, result: q x c
+    return F.cosine_similarity(q_vector.unsqueeze(1), ctx_vectors, dim=-1)
+
+
+def cross_dot_product_scores(q_vectors: T, ctx_vectors: T) -> T:
+    """
+    calculates q->ctx scores for every row in ctx_vector
+    :param q_vectors:
+    :param ctx_vectors:
+    :return:
+    """
+    # q_vector: q x w x d -> q x 1 x w x d, ctx_vectors: c x w x d -> c x d x w, result: q x c x w x w -> q x c x w -> q x c
+    return (q_vectors.unsqueeze(1) @ ctx_vectors.permute(0, 2, 1)).max(3).values.sum(2)
+
+
+def cross_cosine_scores(q_vector: T, ctx_vectors: T):
+    # q_vector: q x w x d -> q x 1 x w x 1 x d, ctx_vectors: c x w x d -> c x 1 x w x d, result: q x c x w x w -> q x c x w -> q x c
+    return F.cosine_similarity(q_vector.unsqueeze(2).unsqueeze(1), ctx_vectors.unsqueeze(1), dim=-1).max(3).values.sum(2)
+
+
+map_comp_func = {
+    'representaton_matching': {
+        "dot_product": repr_dot_product_scores,
+        "cos_sim": repr_cosine_scores
+    },
+    'cross_interaction': {
+        "dot_product": cross_dot_product_scores,
+        "cos_sim": cross_cosine_scores
+    }
+}
 
 
 class BiEncoderNllLoss:
+    def __init__(self, comparison_type: str = 'representaton_matching', comparison_function: str ='dot_product'):
+        self.comparison_type = comparison_type
+        self.comparison_function = map_comp_func[comparison_type][comparison_function]
 
     def calc(
         self,
-        q_vectors: T,
-        ctx_vectors: T,
+        model_output: BiEncoderOutput,
         positive_idx_per_question: list,
-        temperature: float,
+        temperature: float = 1.0,
         hard_negatice_idx_per_question: list = None
     ) -> Tuple[T, int]:
         """
@@ -65,7 +105,16 @@ class BiEncoderNllLoss:
         loss modifications. For example - weighted NLL with different factors for hard vs regular negatives.
         :return: a tuple of loss value and amount of correct predictions per batch
         """
-        scores = self.get_scores(q_vectors, ctx_vectors) / temperature
+        if self.comparison_type == "representaton_matching":
+            q_vectors = model_output.q_pooled
+            ctx_vectors = model_output.ctx_pooled
+        elif self.comparison_type == "cross_interaction":
+            q_vectors = model_output.q_seq
+            ctx_vectors = model_output.ctx_seq
+        else:
+            raise ValueError
+
+        scores = self.comparison_function(q_vectors, ctx_vectors) / temperature
 
         if len(q_vectors.size()) > 1:
             q_num = q_vectors.size(0)
@@ -83,14 +132,8 @@ class BiEncoderNllLoss:
         correct_predictions_count = (max_idxs == torch.tensor(positive_idx_per_question).to(max_idxs.device)).sum()
         return loss, correct_predictions_count
 
-    @staticmethod
-    def get_scores(q_vectors: T, ctx_vectors: T) -> T:
-        f = BiEncoderNllLoss.get_similarity_function()
-        return f(q_vectors, ctx_vectors)
-
-    @staticmethod
-    def get_similarity_function():
-        return dot_product_scores
+    def get_comparison_function(self):
+        return self.comparison_function
 
 
 class BiEncoder(nn.Module):
@@ -125,14 +168,21 @@ class BiEncoder(nn.Module):
         return sequence_output, pooled_output, hidden_states
 
     def forward(self, question_ids: T, question_segments: T, question_attn_mask: T, context_ids: T, ctx_segments: T,
-                ctx_attn_mask: T) -> Tuple[T, T]:
+                ctx_attn_mask: T) -> Tuple[T, T, T, T]:
 
-        _q_seq, q_pooled_out, _q_hidden = self.get_representation(self.question_model, question_ids, question_segments,
+        q_seq, q_pooled, _q_hidden = self.get_representation(self.question_model, question_ids, question_segments,
                                                                   question_attn_mask, self.fix_q_encoder)
-        _ctx_seq, ctx_pooled_out, _ctx_hidden = self.get_representation(self.ctx_model, context_ids, ctx_segments,
+        ctx_seq, ctx_pooled, _ctx_hidden = self.get_representation(self.ctx_model, context_ids, ctx_segments,
                                                                         ctx_attn_mask, self.fix_ctx_encoder)
 
-        return q_pooled_out, ctx_pooled_out
+        # return q_pooled_out, ctx_pooled_out
+        # return q_pooled_out, ctx_pooled_out, _q_seq, _ctx_seq
+        return BiEncoderOutput(
+            q_pooled,
+            q_seq,
+            ctx_pooled,
+            ctx_seq
+        )
 
     @classmethod
     def create_biencoder_single(cls,
