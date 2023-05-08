@@ -13,11 +13,11 @@ BiEncoderBatch = collections.namedtuple(
     'BiENcoderInput',
     [
         'question_ids',
-         'question_segments',
-         'context_ids',
-         'ctx_segments',
-         'positive_ctx_indices',
-         'hard_neg_ctx_indices'
+        'question_segments',
+        'context_ids',
+        'ctx_segments',
+        'positive_ctx_indices',
+        'hard_neg_ctx_indices'
     ]
 )
 

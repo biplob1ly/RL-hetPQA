@@ -20,19 +20,17 @@ from docopt import docopt
 import os
 import shutil
 import time
-import heapq
 from datetime import datetime
 import math
 import torch
 from torch import Tensor as T
 import logging
 import random
-import numpy as np
-from typing import Tuple, Dict
-from configs.config import get_cfg_defaults
+from typing import Tuple
+from configs.dpr_config.config import get_cfg_defaults
 
 from dpr.models.hf_models import get_bert_biencoder_components
-from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch, BiEncoderSingle,BiEncoderOutput
+from dpr.models.biencoder import BiEncoder, BiEncoderNllLoss, BiEncoderBatch, BiEncoderSingle
 from dpr.utils.model_utils import (
     load_states_from_checkpoint, get_model_obj,
     setup_for_distributed_mode, CheckpointState,
@@ -40,7 +38,6 @@ from dpr.utils.model_utils import (
 )
 from dpr.options import set_encoder_params_from_state, get_encoder_params_state, setup_cfg_gpu, set_seed
 from dpr.utils.data_utils import JsonQADataset, SharedDataIterator
-from dpr.indexer.faiss_indexers import DenseFlatIndexer
 from utils import (
     save_ranking_results, save_combined_results, save_eval_metrics, compute_metrics,
     DPRTrainerRun, format_dpr_run, get_ranked_ctxs
@@ -569,16 +566,16 @@ class RetrieverTrainer:
                     )
                     rolling_train_loss = 0.0
 
-                # if step_count % eval_step == 0:
-                #     logger.info(
-                #         "rank=%d, Validation: Epoch: %d iteration: %d/%d",
-                #         cfg.LOCAL_RANK,
-                #         epoch,
-                #         data_iteration,
-                #         epoch_batches,
-                #     )
-                #     self.validate_and_save(epoch, data_iteration, scheduler)
-                #     self.biencoder.train()
+                if step_count % eval_step == 0:
+                    logger.info(
+                        "rank=%d, Validation: Epoch: %d iteration: %d/%d",
+                        cfg.LOCAL_RANK,
+                        epoch,
+                        data_iteration,
+                        epoch_batches,
+                    )
+                    self.validate_and_save(epoch, data_iteration, scheduler)
+                    self.biencoder.train()
 
         logger.info("Epoch finished on rank %d", cfg.LOCAL_RANK)
         self.validate_and_save(epoch, data_iteration, scheduler)
@@ -636,16 +633,18 @@ class RetrieverTrainer:
             epoch += 1
         logger.info('Loading checkpoint @ batch=%s and epoch=%s', offset, epoch)
 
-        self.start_epoch = epoch
-        self.start_batch = offset
+        if self.cfg.DPR.SOLVER.RESET_CHECKPOINT_OFFSET:
+            self.start_epoch = 0
+            self.start_batch = 0
+        else:
+            self.start_epoch = epoch
+            self.start_batch = offset
 
         model_to_load = get_model_obj(self.biencoder)
         logger.info('Loading saved model state ...')
         model_to_load.load_state_dict(saved_state.model_dict, strict=strict)
 
-        if self.cfg.DPR.SOLVER.OPTIMIZER.RESET:
-            pass
-        else:
+        if not self.cfg.DPR.SOLVER.OPTIMIZER.RESET:
             if saved_state.optimizer_dict:
                 logger.info('Loading saved optimizer state ...')
                 self.optimizer.load_state_dict(saved_state.optimizer_dict)

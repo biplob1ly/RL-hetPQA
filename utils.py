@@ -1,12 +1,15 @@
 import collections
 import json
-
 import torch
-import numpy as np
-import pandas as pd
-from ranx import Qrels, Run, evaluate, compare
 import copy
+import re
+import logging
+import pandas as pd
+from flatten_json import flatten
+from ranx import Qrels, Run, evaluate, compare
+from typing import List
 
+logger = logging.getLogger()
 
 DPRTrainerRun = collections.namedtuple(
     'DPRTrainerRun',
@@ -101,6 +104,66 @@ def get_ranked_ctxs(scores, ctx_ids):
     sorted_scores_list = sorted_scores.tolist()
     sorted_ctx_ids = [ctx_ids[i] for i in sorted_indices.tolist()]
     return sorted_scores_list, sorted_ctx_ids
+
+
+def normalize_question(question: str) -> str:
+    question = question.replace("’", "'")
+    return question
+
+
+def normalize_passage_1(ctx_text: str):
+    ctx_text = ctx_text.replace("\n", " ").replace("’", "'")
+    if ctx_text.startswith('"'):
+        ctx_text = ctx_text[1:]
+    if ctx_text.endswith('"'):
+        ctx_text = ctx_text[:-1]
+    return ctx_text
+
+
+def remove_key(json_dt, key='normalized_value'):
+    if isinstance(json_dt, dict):
+        return {k.strip(): remove_key(v) for k, v in json_dt.items() if k != key}
+    else:
+        return json_dt.strip() if isinstance(json_dt, str) else json_dt
+
+
+def normalize_attr_passage(s, do_flatten=False):
+    # We'll start by removing any extraneous white spaces
+    s = re.sub('(\d+\.)}', '\g<1>0}', s)
+    s = re.sub(r'\\"', ' inches', s)
+    if ';' in s:
+        prefix_len = s.index(':')+1
+        s = s[:prefix_len] + '[' + re.sub(';', ',', s[prefix_len:]) + ']'
+    try:
+        t = re.sub('(\w+):', '"\g<1>":', s)
+        json_dt = json.loads('{' + t + '}')
+        json_dt = remove_key(json_dt)
+        out = json.dumps(flatten(json_dt) if do_flatten else json_dt)
+    except:
+        s = re.sub('\"', '', s)
+        s = re.sub(':([^[,}{]+)(,|})', ':"\g<1>"\g<2>', s)
+        s = re.sub('([^}{\s\d"]+):', '"\g<1>":', s)
+        try:
+            json_dt = json.loads('{' + s + '}')
+            json_dt = remove_key(json_dt)
+            out = json.dumps(flatten(json_dt) if do_flatten else json_dt)
+        except:
+            out = s
+    out = re.sub('["\[\]}{]', '', out)
+    out = re.sub(':', ': ', out)
+    out = re.sub('\s+', ' ', out)
+    return out
+
+
+def read_data_from_json_files(paths: List[str]) -> List:
+    results = []
+    for i, path in enumerate(paths):
+        with open(path, "r", encoding="utf-8") as f:
+            logger.info("Reading file %s" % path)
+            data = json.load(f)
+            results.extend(data)
+            logger.info("Aggregated data size: {}".format(len(results)))
+    return results
 
 
 def precision_recall_at_k(ranked_items, k):
