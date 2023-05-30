@@ -1,249 +1,262 @@
 import logging
 import glob
-import math
 import random
 import collections
-from typing import List, Iterator, Callable
+from typing import List, Union
 from torch.utils.data import Dataset
-from torch import Tensor as T
-from utils import normalize_question, normalize_attr_passage, read_data_from_json_files
+import re
+import json
+import unicodedata
+from flatten_json import flatten
+
+RetBatch = collections.namedtuple(
+    'RetBatch',
+    [
+        'qids', 'cids_per_qid', 'srcs_per_qid', 'pos_cids_per_qid',
+        'q_input_ids', 'q_attention_mask', 'q_token_type_ids',
+        'ctx_input_ids', 'ctx_attention_mask', 'ctx_token_type_ids'
+    ]
+)
+
+
+RetContext = collections.namedtuple("Context", ["cid", "text", "source"])
 
 logger = logging.getLogger()
-BiEncoderPassage = collections.namedtuple("BiEncoderPassage", ["cid", "text", "title", "source"])
 
 
-class Tensorizer(object):
-    """
-    Component for all text to model input data conversions and related utility methods
-    """
-
-    # Note: title, if present, is supposed to be put before text (i.e. optional title + document body)
-    def text_to_tensor(self, text: str, title: str = None, add_special_tokens: bool = True):
-        raise NotImplementedError
-
-    def get_pair_separator_ids(self) -> T:
-        raise NotImplementedError
-
-    def get_pad_id(self) -> int:
-        raise NotImplementedError
-
-    def get_attn_mask(self, tokens_tensor: T):
-        raise NotImplementedError
-
-    def is_sub_word_id(self, token_id: int):
-        raise NotImplementedError
-
-    def to_string(self, token_ids, skip_special_tokens=True):
-        raise NotImplementedError
-
-    def set_pad_to_max(self, pad: bool):
-        raise NotImplementedError
-
-    def get_skip_list(self, tokens):
-        raise NotImplementedError
+def normalize_question(question: str) -> str:
+    question = unicodedata.normalize('NFKD', question).encode('ascii', 'ignore').decode("utf-8", "ignore").strip()
+    return question
 
 
-class BiEncoderSample:
+def remove_key(json_dt):
+    if isinstance(json_dt, dict):
+        json_dt = {k.strip(): remove_key(v) for k, v in json_dt.items() if k != 'normalized_value'}
+        if set(json_dt.keys()) == {'unit', 'value'}:
+            return f"{json_dt['value']} {json_dt['unit']}"
+        elif set(json_dt.keys()) == {'currency', 'value'}:
+            return f"{json_dt['value']} {json_dt['currency']}"
+        return json_dt
+    else:
+        return json_dt.strip() if isinstance(json_dt, str) else json_dt
+
+
+def normalize_attr_context(text, do_flatten):
+    s = text
+    if ';' in s:
+        prefix_len = s.index(':')+1
+        s = s[:prefix_len] + '[' + re.sub(';', ',', s[prefix_len:]) + ']'
+    try:
+        t = re.sub('(\w+):', '"\g<1>":', s)
+        json_dt = json.loads('{' + t + '}')
+        json_dt = remove_key(json_dt)
+        out = json.dumps(flatten(json_dt, ' ') if do_flatten else json_dt)
+    except:
+        s = re.sub('\"', '', s)
+        s = re.sub(':([^[,}{]+)(,|})', ':"\g<1>"\g<2>', s)
+        s = re.sub('([^}{\s\d"]+):', '"\g<1>":', s)
+        try:
+            json_dt = json.loads('{' + s + '}')
+            json_dt = remove_key(json_dt)
+            out = json.dumps(flatten(json_dt, ' ') if do_flatten else json_dt)
+        except:
+            out = s
+    out = re.sub('["\[\]}{]', '', out)
+    out = re.sub(':', ' : ', out)
+    out = re.sub('_', ' ', out)
+    out = re.sub('\s+', ' ', out)
+    return out
+
+
+def normalize_context(context, do_flatten=True):
+    s = context['text']
+    s = re.sub(u"(\u2018|\u2019)", "'", s)
+    s = re.sub(u"(\u201c|\u201d)", '"', s)
+    s = re.sub(u"\u00d7", 'x', s)
+    s = re.sub(u"(\u2013|\u2014)", '-', s)
+    s = re.sub('\s+', ' ', s)
+    s = re.sub('(\d+\.)\s?}', '\g<1>0}', s)
+    s = re.sub(r'(\d+(\.\d+)?)\s?[\\"|"|'']', '\g<1> inches ', s)
+    s = re.sub(r'(\d+(\.\d+)?)\s?[\\′|′]', '\g<1> feet ', s)
+    s = re.sub(r'"|\"|\\"', '', s)
+    s = re.sub(r'(\d+(\.\d+)?)\s?lb', '\g<1> pound', s)
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode("utf-8", "ignore").strip()
+    s = re.sub('\s+', ' ', s)
+    s = re.sub(r'(\d+(\.\d+)?(\s\w+)?)\s?l? x (\d+(\.\d+)?(\s\w+)?)\s?w? x (\d+(\.\d+)?(\s\w+)?)\s?h?', 'length \g<1> x width \g<4> x height \g<7>', s)
+    s = re.sub(r'(\d+(\.\d+)?(\s\w+)?)\s?h? x (\d+(\.\d+)?(\s\w+)?)\s?w? x (\d+(\.\d+)?(\s\w+)?)\s?d?', 'height \g<1> x width \g<4> x depth \g<7>', s)
+    s = re.sub(r'(\d+(\.\d+)?(\s\w+)?)\s?l? x (\d+(\.\d+)?(\s\w+)?)\s?w?', 'length \g<1> x width \g<4>', s)
+    s = re.sub('\s+', ' ', s)
+    context['text'] = s
+    if context.get("source", None) == "attribute":
+        context['text'] = normalize_attr_context(context['text'], do_flatten=do_flatten)
+    return context
+
+
+def read_data_from_json_files(paths: List[str]) -> List:
+    results = []
+    for i, path in enumerate(paths):
+        with open(path, "r", encoding="utf-8") as f:
+            logger.info("Reading file %s" % path)
+            data = json.load(f)
+            results.extend(data)
+            logger.info("Aggregated data size: {}".format(len(results)))
+    return results
+
+
+class RetSample:
     qid: str
-    query: str
-    positive_passages: List[BiEncoderPassage]
-    negative_passages: List[BiEncoderPassage]
-    hard_negative_passages: List[BiEncoderPassage]
+    question: str
+    positive_ctxs: List[RetContext]
+    negative_ctxs: List[RetContext]
 
 
-class QADataset(Dataset):
+class RetDataset(Dataset):
     def __init__(
-        self,
-        special_token: str = None,
-        shuffle_positives: bool = False,
-        query_special_suffix: str = None,
-        encoder_type: str = None,
+            self,
+            file: str,
+            num_pos_ctx: Union[int, None] = 1,
+            num_total_ctx: Union[int, None] = 5,
+            normalize: bool = False,
+            flatten_attr: bool = False,
+            insert_source: bool = True,
+            is_train: bool = False
     ):
-        self.special_token = special_token
-        self.encoder_type = encoder_type
-        self.shuffle_positives = shuffle_positives
-        self.query_special_suffix = query_special_suffix
+        self.file = file
         self.data = []
-
-    def load_data(self, start_pos: int = -1, end_pos: int = -1):
-        raise NotImplementedError
-
-    def calc_total_data_len(self):
-        raise NotImplementedError
+        self.data_files = []
+        self.num_pos_ctx = num_pos_ctx
+        self.num_total_ctx = num_total_ctx
+        self.normalize = normalize
+        self.flatten_attr = flatten_attr
+        self.insert_source = insert_source
+        self.is_train = is_train
+        self.load_data()
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, index):
-        raise NotImplementedError
-
-    def _process_query(self, query: str):
-        # as of now, always normalize query
-        query = normalize_question(query)
-        if self.query_special_suffix and not query.endswith(self.query_special_suffix):
-            query += self.query_special_suffix
-        return query
-
-
-class JsonQADataset(QADataset):
-    def __init__(
-        self,
-        file: str,
-        special_token: str = None,
-        encoder_type: str = None,
-        shuffle_positives: bool = False,
-        normalize: bool = False,
-        flatten_attr: bool = False,
-        query_special_suffix: str = None,
-        exclude_gold: bool = False
-    ):
-        super().__init__(
-            special_token=special_token,
-            encoder_type=encoder_type,
-            shuffle_positives=shuffle_positives,
-            query_special_suffix=query_special_suffix,
-        )
-        self.file = file
-        self.data_files = []
-        self.normalize = normalize
-        self.flatten_attr = flatten_attr
-        self.exclude_gold = exclude_gold
-
-    def calc_total_data_len(self):
-        if not self.data:
-            self._load_all_data()
-        return len(self.data)
-
-    def load_data(self, start_pos: int = -1, end_pos: int = -1):
-        if not self.data:
-            self._load_all_data()
-        if start_pos >= 0 and end_pos >= 0:
-            logger.info("Selecting subset range from %d to %d", start_pos, end_pos)
-            self.data = self.data[start_pos:end_pos]
-
-    def _load_all_data(self):
-        logger.info("Loading all data")
-        self.data_files = glob.glob(self.file)
-        logger.info("Data files: %s", self.data_files)
-        data = read_data_from_json_files(self.data_files)
-        # filter those without positive ctx
-        self.data = [r for r in data if len(r["positive_ctxs"]) > 0]      # TODO: remove subscript
-        logger.info("Total cleaned data size: %d", len(self.data))
-
-    def __getitem__(self, index) -> BiEncoderSample:
-        json_sample = self.data[index]
-        r = BiEncoderSample()
-        r.qid = json_sample["qid"]
-        r.query = self._process_query(json_sample["question"])
-
-        positive_ctxs = json_sample["positive_ctxs"]
-        negative_ctxs = json_sample["negative_ctxs"] if "negative_ctxs" in json_sample else []
-        hard_negative_ctxs = json_sample["hard_negative_ctxs"] if "hard_negative_ctxs" in json_sample else []
-
-        def create_passage(ctx: dict):
-            if self.normalize:
-                if ctx.get("source", None) == "attribute":
-                    ctx["text"] = normalize_attr_passage(ctx["text"], self.flatten_attr)
-            return BiEncoderPassage(
-                ctx.get("cid", None),
-                ctx["text"],
-                ctx.get("title", None),
-                ctx.get("source", None)
-            )
-
-        r.positive_passages = [create_passage(ctx) for ctx in positive_ctxs]
-        r.negative_passages = [create_passage(ctx) for ctx in negative_ctxs]
-        r.hard_negative_passages = [create_passage(ctx) for ctx in hard_negative_ctxs]
-        return r
-
-
-class SharedDataIterator:
-    """
-    General purpose data iterator to be used for Pytorch's DDP mode where every node should handle its own part of
-    the data.
-    Instead of cutting data shards by their min size, it sets the amount of iterations by the maximum shard size.
-    It fills the extra sample by just taking first samples in a shard.
-    It can also optionally enforce identical batch size for all iterations (might be useful for DP mode).
-    """
-    def __init__(
-        self,
-        dataset: QADataset,
-        shard_id: int = 0,
-        num_shards: int = 1,
-        batch_size: int = 1,
-        shuffle=True,
-        shuffle_seed: int = 0,
-        offset: int = 0,
-        strict_batch_size: bool = False,
-    ):
-        self.dataset = dataset
-
-        logger.info("Calculating shard positions")
-        self.shards_num = max(num_shards, 1)
-        self.shard_id = max(shard_id, 0)
-        total_size = dataset.calc_total_data_len()
-        samples_per_shard = math.ceil(total_size / self.shards_num)
-        self.shard_start_idx = self.shard_id * samples_per_shard
-        self.shard_end_idx = min(self.shard_start_idx + samples_per_shard, total_size)
-
-        if strict_batch_size:
-            self.max_iterations = math.ceil(samples_per_shard / batch_size)
+        example = self.data[index]
+        ret_sample = RetSample()
+        ret_sample.qid = example['qid']
+        ret_sample.question = normalize_question(example['question'])
+        if self.num_total_ctx:
+            pos_ctxs = example['positive_ctxs'][:self.num_pos_ctx]
+            if self.num_pos_ctx and len(pos_ctxs) < self.num_pos_ctx:
+                pos_ctxs.extend(random.choices(example['positive_ctxs'], k=self.num_pos_ctx-len(pos_ctxs)))
+            num_neg_ctx = self.num_total_ctx - len(pos_ctxs)
+            neg_ctxs = example['negative_ctxs'][:num_neg_ctx]
+            if len(neg_ctxs) < num_neg_ctx:
+                neg_ctxs.extend(random.choices(example['negative_ctxs'], k=num_neg_ctx-len(neg_ctxs)))
+        elif not self.num_total_ctx and not self.num_pos_ctx:
+            pos_ctxs = example['positive_ctxs']
+            neg_ctxs = example['negative_ctxs']
         else:
-            self.max_iterations = int(samples_per_shard / batch_size)
-        logger.debug(
-            'samples_per_shard=%d, shard_start_idx=%d, shard_end_idx=%d, max_iterations=%d',
-            samples_per_shard,
-            self.shard_start_idx,
-            self.shard_end_idx,
-            self.max_iterations)
+            raise ValueError("Number of total context can't be variable if not test set")
+        ret_sample.positive_ctxs = [self.build_ret_context(ctx) for ctx in pos_ctxs]
+        ret_sample.negative_ctxs = [self.build_ret_context(ctx) for ctx in neg_ctxs]
+        return ret_sample
 
-        self.iteration = offset  # to track in-shard iteration status
-        self.shuffle = shuffle
-        self.batch_size = batch_size
-        self.shuffle_seed = shuffle_seed
-        self.strict_batch_size = strict_batch_size
+    def build_ret_context(self, ctx):
+        if self.normalize:
+            ctx = normalize_context(ctx, self.flatten_attr)
+        cid = ctx['cid']
+        text = (ctx['source'] + ' ' + ctx['text']) if self.insert_source else ctx['text']
+        source = ctx['source']
+        return RetContext(cid, text, source)
 
-    def total_data_len(self) -> int:
-        return len(self.dataset)
+    def load_data(self):
+        if not self.data:
+            logger.info("Loading all answer generation data")
+            self.data_files = glob.glob(self.file)
+            logger.info("Data files: %s", self.data_files)
+            data = read_data_from_json_files(self.data_files)
+            clean_data = []
+            for sample in data:
+                if self.is_train and len(sample["positive_ctxs"]) > 0:
+                    if len(sample["negative_ctxs"]) <= 0:
+                        sample["negative_ctxs"] = [random.choice(clean_data)["positive_ctxs"][0] for _ in range(5)]
+                    clean_data.append(sample)
+                elif len(sample["positive_ctxs"]) > 0:
+                    clean_data.append(sample)
+            self.data = clean_data    # TODO: remove subscript here
+            logger.info("Total cleaned data size: %d", len(self.data))
 
-    def get_iteration(self) -> int:
-        return self.iteration
+    def get_example(self, index):
+        return self.data[index]
 
-    def apply(self, visitor_func: Callable):
-        for sample in self.dataset:
-            visitor_func(sample)
 
-    def get_shard_indices(self, epoch: int):
-        indices = list(range(len(self.dataset)))
-        if self.shuffle:
-            # to be able to resume, same shuffling should be used when starting from a failed/stopped iteration
-            epoch_rnd = random.Random(self.shuffle_seed + epoch)
-            epoch_rnd.shuffle(indices)
-        shard_indices = indices[self.shard_start_idx : self.shard_end_idx]
-        return shard_indices
+class RetCollator:
+    def __init__(self, tokenizer, question_max_len=None, ctx_max_len=None):
+        self.tokenizer = tokenizer
+        self.question_max_len = min(question_max_len, tokenizer.model_max_length) if question_max_len else tokenizer.model_max_length
+        self.ctx_max_len = min(ctx_max_len, tokenizer.model_max_length) if ctx_max_len else tokenizer.model_max_length
 
-    def iterate_data(self, epoch: int = 0) -> Iterator[List]:
-        # if resuming iteration somewhere in the middle of epoch, one needs to adjust max_iterations
-        max_iterations = self.max_iterations - self.iteration
-        shard_indices = self.get_shard_indices(epoch)
+    def encode_question(self, batch_question):
+        enc = self.tokenizer(
+            batch_question,
+            max_length=self.question_max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        q_input_ids = enc['input_ids']
+        q_attention_mask = enc['attention_mask']
+        q_token_type_ids = enc['token_type_ids']
+        return q_input_ids, q_attention_mask, q_token_type_ids
 
-        for i in range(self.iteration * self.batch_size, len(shard_indices), self.batch_size):
-            items_idxs = shard_indices[i : i + self.batch_size]
-            if self.strict_batch_size and len(items_idxs) < self.batch_size:
-                logger.debug("Extending batch to max size")
-                items_idxs.extend(shard_indices[0 : self.batch_size - len(items)])
-            self.iteration += 1
-            items = [self.dataset[idx] for idx in items_idxs]
-            yield items
+    def encode_contexts(self, batch_contexts):
+        enc = self.tokenizer(
+            batch_contexts,
+            max_length=self.ctx_max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        ctx_input_ids = enc['input_ids']
+        ctx_attention_mask = enc['attention_mask']
+        ctx_token_type_ids = enc['token_type_ids']
+        return ctx_input_ids, ctx_attention_mask, ctx_token_type_ids
 
-        # some shards may done iterating while the others are at the last batch. Just return the first batch
-        while self.iteration < max_iterations:
-            logger.debug("Fulfilling non complete shard=".format(self.shard_id))
-            self.iteration += 1
-            items_idxs = shard_indices[0 : self.batch_size]
-            items = [self.dataset[idx] for idx in items_idxs]
-            yield items
+    def __call__(self, batch):
+        batch_question = []
+        batch_contexts = []
+        qids = []
+        cids_per_qid = []
+        srcs_per_qid = []
+        pos_cids_per_qid = []
+        for sample in batch:
+            pos_neg_ctxs = sample.positive_ctxs + sample.negative_ctxs
+            random.shuffle(pos_neg_ctxs)
+            sample_cids = []
+            sample_sources = []
+            sample_ctxs = []
+            for ctx in pos_neg_ctxs:
+                sample_cids.append(ctx.cid)
+                sample_ctxs.append(ctx.text)
+                sample_sources.append(ctx.source)
+            sample_pos_cids = [ctx.cid for ctx in sample.positive_ctxs]
 
-        logger.info("Finished iterating, iteration={}, shard={}".format(self.iteration, self.shard_id))
-        # reset the iteration status
-        self.iteration = 0
+            # Dim: Q
+            batch_question.append(sample.question)
+            # extend instead of append: grouping all the ctx in single list
+            # Dim: Q*C, e.g. C=5
+            batch_contexts.extend(sample_ctxs)
+            # Dim: Q
+            qids.append(sample.qid)
+            # Dim: Q x C
+            cids_per_qid.append(sample_cids)
+            # Dim: Q x C
+            srcs_per_qid.append(sample_sources)
+            # Dim: Q x PC
+            pos_cids_per_qid.append(sample_pos_cids)
+
+        # Dim: Q x S
+        q_input_ids, q_attention_mask, q_token_type_ids = self.encode_question(batch_question)
+        # Dim: (Q*C) x S
+        ctx_input_ids, ctx_attention_mask, ctx_token_type_ids = self.encode_contexts(batch_contexts)
+        return RetBatch(
+            qids, cids_per_qid, srcs_per_qid, pos_cids_per_qid,
+            q_input_ids, q_attention_mask, q_token_type_ids,
+            ctx_input_ids, ctx_attention_mask, ctx_token_type_ids
+        )

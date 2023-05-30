@@ -53,8 +53,7 @@ def load_states_from_checkpoint(checkpoint_path: str) -> CheckpointState:
 def set_model_cfg_from_state(state, cfg):
     if not state:
         return
-
-    override_params = [(param, state[param]) for param in model_params_to_save if param in state and state[param]]
+    override_params = [(param, state[param]) for param in model_params_to_save if param in state]
     for param, value in override_params:
         if hasattr(cfg.RAG.MODEL, param):
             logger.warning('Overriding cfg parameter value from checkpoint state. Param = %s, value = %s', param,
@@ -80,10 +79,10 @@ def get_model_obj(model: nn.Module):
 
 def get_model_components(cfg, model_path=None):
     # modify based on cfg so it could load both bert and roberta models
-    if 't5' in cfg.RAG.MODEL.MODEL_CFG:
-        tokenizer = T5Tokenizer.from_pretrained(cfg.RAG.MODEL.MODEL_CFG)
+    if 't5' in cfg.RAG.MODEL.PRETRAINED_MODEL_CFG:
+        tokenizer = T5Tokenizer.from_pretrained(cfg.RAG.MODEL.PRETRAINED_MODEL_CFG)
         if not model_path:
-            t5 = T5ForConditionalGeneration.from_pretrained(cfg.RAG.MODEL.MODEL_CFG)
+            t5 = T5ForConditionalGeneration.from_pretrained(cfg.RAG.MODEL.PRETRAINED_MODEL_CFG)
             model = RAG_T5(t5.config)
             model.load_t5(t5.state_dict())
         else:

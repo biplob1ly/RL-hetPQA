@@ -36,9 +36,7 @@ from rag.utils.model_utils import (
     load_states_from_checkpoint, CheckpointState, get_model_obj,
     set_model_cfg_from_state, get_model_params_state
 )
-from rag.utils.data_utils import (
-    Collator, GenSample, GenDataset
-)
+from rag.utils.data_utils import GenDataset, GenCollator
 from rag.options import setup_cfg_gpu, set_seed
 from rag_utils import BLEUScorer, RAGValResult, format_rag_validation, save_combined_results, save_eval_metrics, delete
 
@@ -76,13 +74,14 @@ class RAGTrainer:
         self.best_cp_name = None
         self.train_dataset = None
         self.val_dataset = None
-        self.collator = Collator(tokenizer, cfg.RAG.MODEL.PROMPT_MAX_LENGTH, cfg.RAG.MODEL.ANSWER_MAX_LENGTH)
+        self.collator = GenCollator(tokenizer, cfg.RAG.MODEL.PROMPT_MAX_LENGTH, cfg.RAG.MODEL.ANSWER_MAX_LENGTH)
         self.eval_scorer = BLEUScorer()
         if saved_state:
             self._load_saved_state(saved_state)
 
     def evaluate(self, eval_dataset: GenDataset):
         logger.info('Evaluating generator ...')
+        self.generator.eval()
         cfg = self.cfg
         eval_sampler = SequentialSampler(eval_dataset)
         eval_data_loader = DataLoader(
@@ -93,7 +92,6 @@ class RAGTrainer:
             num_workers=1,
             collate_fn=self.collator
         )
-        self.generator.eval()
         bleu_scores = []
         result_data = []
         with torch.no_grad():
@@ -174,6 +172,7 @@ class RAGTrainer:
                         break
 
     def train(self, train_dataset, val_dataset=None):
+        self.generator.train()
         cfg = self.cfg
         train_sampler = RandomSampler(train_dataset)
         train_data_loader = DataLoader(

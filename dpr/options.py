@@ -1,46 +1,11 @@
 import os
+import gc
 import random
 import torch
 import socket
 import logging
 import numpy as np
 logger = logging.getLogger()
-
-
-def get_encoder_checkpoint_params_names():
-    return ['PRETRAINED_MODEL_CFG',
-            'ENCODER_MODEL_TYPE',
-            'PRETRAINED_FILE',
-            'POOLING_PROJECTION_DIM',
-            'SEQUENCE_PROJECTION_DIM',
-            'SEQUENCE_LENGTH',
-            'DO_LOWER_CASE']
-
-
-def get_encoder_params_state(cfg):
-    """
-     Selects the param values to be saved in a checkpoint, so that a trained model faile can be used for downstream
-     tasks without the need to specify these parameter again
-    :return: Dict of params to memorize in a checkpoint
-    """
-    params_to_save = get_encoder_checkpoint_params_names()
-    r = {}
-    for param in params_to_save:
-        r[param] = getattr(cfg.DPR.MODEL, param)
-    return r
-
-
-def set_encoder_params_from_state(state, cfg):
-    if not state:
-        return
-    params_to_save = get_encoder_checkpoint_params_names()
-
-    override_params = [(param, state[param]) for param in params_to_save if param in state and state[param]]
-    for param, value in override_params:
-        if hasattr(cfg.DPR.MODEL, param):
-            logger.warning('Overriding cfg parameter value from checkpoint state. Param = %s, value = %s', param,
-                           value)
-        setattr(cfg.DPR.MODEL, param, value)
 
 
 def set_seed(seed):
@@ -51,6 +16,16 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
+
+
+def report_cache_memory():
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print("{:.3f}MB allocated".format(torch.cuda.memory_allocated() / 1024 ** 2))
+    else:
+        pass
 
 
 def setup_cfg_gpu(cfg):

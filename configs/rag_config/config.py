@@ -38,10 +38,10 @@ _C.RAG.DO_TEST = True
 # -----------------------------------------------------------------------------
 _C.RAG.DATA = CfgNode()
 _C.RAG.DATA.NAME = 'hetPQA'
-_C.RAG.DATA.DATA_PATH = './data/'
-_C.RAG.DATA.TRAIN_DATA_PATH = './data/train.json'
-_C.RAG.DATA.VAL_DATA_PATH = './data/dev.json'
-_C.RAG.DATA.TEST_DATA_PATH = './data/test.json'
+_C.RAG.DATA.DATA_PATH = './data/answer_generation/'
+_C.RAG.DATA.TRAIN_DATA_PATH = './data/answer_generation/train.json'
+_C.RAG.DATA.VAL_DATA_PATH = './data/answer_generation/dev.json'
+_C.RAG.DATA.TEST_DATA_PATH = './data/answer_generation/test.json'
 _C.RAG.DATA.NUM_CONTEXT = 3
 _C.RAG.DATA.INSERT_SOURCE = False
 _C.RAG.DATA.NORMALIZE = True
@@ -53,13 +53,13 @@ _C.RAG.DATA.FLATTEN_ATTRIBUTE = True
 _C.RAG.MODEL = CfgNode()
 _C.RAG.MODEL.MODEL_PATH = None
 # config name for rag.MODEL initialization
-_C.RAG.MODEL.MODEL_CFG = 't5-base'
+_C.RAG.MODEL.PRETRAINED_MODEL_CFG = 't5-base'
 # Max length of the encoder input sequence
 _C.RAG.MODEL.PROMPT_MAX_LENGTH = 200
 _C.RAG.MODEL.ANSWER_MAX_LENGTH = None
 # Whether to lower case the input text. Set True for uncased rag.MODELs, False for the cased ones.
 _C.RAG.MODEL.DO_LOWER_CASE = True
-_C.RAG.MODEL.CHECKPOINT_FILE_NAME = 'rag'
+_C.RAG.MODEL.CHECKPOINT_FILE_NAME = 'rag_ckpt'
 _C.RAG.MODEL.DROPOUT = 0.1
 
 _C.RAG.SOLVER = CfgNode()
@@ -69,16 +69,10 @@ _C.RAG.SOLVER.VAL_BATCH_SIZE = 4
 _C.RAG.SOLVER.TEST_BATCH_SIZE = 1
 _C.RAG.SOLVER.TOTAL_TRAIN_STEPS = 1000
 _C.RAG.SOLVER.NUM_STEP_PER_EVAL = 300
-_C.RAG.SOLVER.CP_SAVE_LIMIT = 3
+_C.RAG.SOLVER.CP_SAVE_LIMIT = 1
 # Logging interval in terms of batches
-_C.RAG.SOLVER.LOG_BATCH_STEP = 2
-_C.RAG.SOLVER.LOG_TEST_STEP = 1000
-_C.RAG.SOLVER.TEST_CTX_BSZ = 8
-_C.RAG.SOLVER.TRAIN_ROLLING_LOSS_STEP = 2
 _C.RAG.SOLVER.RESET_CHECKPOINT_STEP = False
 
-_C.RAG.SOLVER.COMPARISON_TYPE = 'representaton_matching'
-_C.RAG.SOLVER.COMPARISON_FUNCTION = 'dot_product'
 _C.RAG.SOLVER.TEMPERATURE = 0.5
 
 _C.RAG.SOLVER.OPTIMIZER = CfgNode()
