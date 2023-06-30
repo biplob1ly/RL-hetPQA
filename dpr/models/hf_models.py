@@ -72,7 +72,7 @@ class HFBertEncoder(BertModel):
         )
 
         last_hidden_state = model_out.last_hidden_state
-        pooled_output = model_out.pooler_output
+        # pooled_output = model_out.pooler_output
         # hidden_states = model_out.hidden_states
         if self.dpr_config.CROSS_INTERACTION:
             if self.dpr_config.PROJECTION_DIM:

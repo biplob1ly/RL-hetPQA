@@ -417,7 +417,7 @@ def run(cfg):
                         "hits@5", "precision@3", "precision@5", "map@1", "map@3",
                         "map@5", "recall@1", "recall@3", "recall@5", "f1@1", "f1@3", "f1@5"]
         metrics_dt = compute_metrics(result_list, eval_metrics, comp_separate=True)
-        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, f'eval_metrics')
+        eval_metrics_path = os.path.join(cfg.OUTPUT_PATH, 'eval_metrics')
         save_eval_metrics(metrics_dt, eval_metrics_path)
         logger.info('Evaluation done. Score per metric saved in %s', eval_metrics_path)
 
